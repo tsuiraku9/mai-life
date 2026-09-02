@@ -75,17 +75,12 @@ class LifeScheduler:
         await self.stop()
         self._stop = asyncio.Event()
         config = self._get_config()
-        if generate_if_missing and config.plugin.enabled:
-            now = self._now(config)
-            if self._load_today(now) is None:
-                try:
-                    await self._generate_today(False)
-                except Exception:
-                    logger.exception("启动时生成今日生活记录失败")
         self._tasks = [
             asyncio.create_task(self._generation_loop(), name="mai-life-generate"),
             asyncio.create_task(self._patrol_loop(), name="mai-life-patrol"),
         ]
+        if generate_if_missing and config.plugin.enabled:
+            self._tasks.append(asyncio.create_task(self._backfill_missing(), name="mai-life-backfill"))
 
     async def stop(self) -> None:
         """停止循环并等待退出。"""
@@ -100,6 +95,43 @@ class LifeScheduler:
 
     def _now(self, config: MaiLifeConfig) -> datetime:
         return wall_clock_now(config.generation.timezone)
+
+    def _needs_backfill(self, config: MaiLifeConfig, document: LifeDocument | None) -> bool:
+        if document is None:
+            return True
+        if config.schedule.enabled and not document.activities:
+            return True
+        if config.share.enabled and not document.shares:
+            return True
+        return False
+
+    async def _backfill_missing(self) -> None:
+        """启动后补生成：日程文件已有但分享任务因当时没有聊天流而空着时再试。"""
+
+        delays = (0, 15, 45)
+        for delay in delays:
+            if delay:
+                await self._wait(delay)
+            if self._stop.is_set():
+                return
+            config = self._get_config()
+            if not config.plugin.enabled:
+                return
+            try:
+                now = self._now(config)
+            except ValueError:
+                logger.exception("时区无效，跳过启动补生成")
+                return
+            document = self._load_today(now)
+            if not self._needs_backfill(config, document):
+                return
+            try:
+                await self._generate_today(False)
+            except Exception:
+                logger.exception("启动时生成今日生活记录失败")
+            document = self._load_today(now)
+            if not self._needs_backfill(config, document):
+                return
 
     async def _generation_loop(self) -> None:
         while not self._stop.is_set():

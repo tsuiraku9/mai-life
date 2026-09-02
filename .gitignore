@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 AGENTS.md
+_live_*.py
+_live_*.json
 .mypy_cache/
 .ruff_cache/
 .venv/

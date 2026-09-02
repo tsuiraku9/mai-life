@@ -86,7 +86,7 @@ python -m pytest tests -q
 
 ## 依赖
 
-- MaiBot >= 1.0.0（本机验证版本 1.1.4）
+- MaiBot >= 1.2.3
 - maibot-plugin-sdk >= 2.7.1
 
 ## 协议
