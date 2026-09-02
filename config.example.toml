@@ -1,0 +1,65 @@
+# 示例配置。真实运行时由 MaiBot 根据 config_model 生成 plugins/mai-life/config.toml。
+# 不要把本地 config.toml 提交进仓库。
+
+[plugin]
+enabled = false
+config_version = "1.0.0"
+
+[generation]
+time = "01:30"
+timezone = "local"
+model = "planner"
+max_tokens = 4096
+temperature = -1.0
+llm_timeout_ms = 120000
+generate_on_load_if_missing = true
+include_persona = true
+include_history = true
+include_knowledge = true
+persona_source = "both"
+extra_persona = ""
+history_message_limit = 30
+history_window_hours = 24
+knowledge_search_limit = 5
+history_stream_ids = []
+
+[schedule]
+enabled = true
+# 例: ["session:xxx", "qq:group:123", "qq:private:456", "all"]
+allowed_streams = []
+stream_discovery_platform = "all_platforms"
+activity_count_min = 8
+activity_count_max = 14
+wake_time = "08:00"
+sleep_time = "01:00"
+recent_inject_count = 3
+inject_window_minutes = 180
+
+[share]
+enabled = true
+stream_discovery_platform = "all_platforms"
+count_min = 3
+count_max = 6
+extra_prompt = ""
+stream_profiles = []
+# 填写聊天流即启用该聊天流。条数填 0、额外提示词留空则用上面的默认值。
+# [[share.stream_profiles]]
+# stream = "qq:private:123456"
+# count_min = 2
+# count_max = 4
+# extra_prompt = "只聊日常小事，不要提工作。"
+# [[share.stream_profiles]]
+# stream = "all"
+wake_planner = true
+patrol_interval_seconds = 60
+cooldown_seconds = 180
+silence_start = "00:00"
+silence_end = "07:30"
+miss_tolerance_minutes = 30
+
+# [prompts] 各提示词可在 WebUI 中整段修改。留空则使用内置默认值。
+# 占位符：{date} {weekday} {now} {timezone} {bot_nickname} {persona}
+# {history} {knowledge} {yesterday_tail} {schedule_json} {share_json}
+# {recent_schedule} {user_request} {wake_time} {sleep_time}
+# {activity_count_min} {activity_count_max} {share_count_min} {share_count_max}
+# {stream_info} {share_item} {target} {action}

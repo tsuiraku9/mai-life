@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+AGENTS.md
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+config.toml
+*.egg-info/
+.DS_Store
+Thumbs.db

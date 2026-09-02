@@ -1,0 +1,40 @@
+{
+  "manifest_version": 2,
+  "id": "mailife.mai-life",
+  "version": "1.1.0",
+  "name": "麦麦生活",
+  "description": "自动生成每日日程与聊天分享任务，在聊天时注入规划器，并在提醒时间唤醒规划器。",
+  "author": {
+    "name": "mailife",
+    "url": "https://github.com/tsuiraku9"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/tsuiraku9/mai-life",
+    "homepage": "https://github.com/tsuiraku9/mai-life",
+    "documentation": "https://github.com/tsuiraku9/mai-life",
+    "issues": "https://github.com/tsuiraku9/mai-life/issues"
+  },
+  "host_application": {
+    "min_version": "1.2.3",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.7.1",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "llm.generate",
+    "chat.get_all_streams",
+    "maisaka.proactive.trigger",
+    "message.get_by_time_in_chat",
+    "message.build_readable",
+    "knowledge.search",
+    "config.get",
+    "send.text"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN"
+  }
+}
