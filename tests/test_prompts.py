@@ -1,4 +1,4 @@
-from mailife.prompts import DEFAULT_SCHEDULE_USER, choose_template, render_template
+from mailife.prompts import DEFAULT_SCHEDULE_USER, DEFAULT_SHARE_USER, choose_template, render_template
 
 
 def test_render_known_placeholders() -> None:
@@ -27,3 +27,15 @@ def test_choose_template_fallback() -> None:
 def test_schedule_prompt_has_no_mood() -> None:
     assert "mood" not in DEFAULT_SCHEDULE_USER
     assert "心情" not in DEFAULT_SCHEDULE_USER
+
+
+def test_schedule_prompt_includes_recent_days() -> None:
+    assert "{recent_days_schedule}" in DEFAULT_SCHEDULE_USER
+    assert "近几日日程" in DEFAULT_SCHEDULE_USER
+    assert "不要生成几乎相同的安排" in DEFAULT_SCHEDULE_USER
+
+
+def test_share_prompt_includes_silence_window() -> None:
+    assert "{silence_start}" in DEFAULT_SHARE_USER
+    assert "{silence_end}" in DEFAULT_SHARE_USER
+    assert "静默时段" in DEFAULT_SHARE_USER

@@ -16,11 +16,11 @@ generate_on_load_if_missing = true
 include_persona = true
 include_history = true
 include_knowledge = true
-persona_source = "both"
 extra_persona = ""
 history_message_limit = 30
 history_window_hours = 24
 knowledge_search_limit = 5
+knowledge_window_hours = 168
 history_stream_ids = []
 
 [schedule]
@@ -32,17 +32,14 @@ activity_count_min = 8
 activity_count_max = 14
 wake_time = "08:00"
 sleep_time = "01:00"
+recent_days = 3
 recent_inject_count = 3
 inject_window_minutes = 180
 
 [share]
 enabled = true
-stream_discovery_platform = "all_platforms"
-count_min = 3
-count_max = 6
-extra_prompt = ""
 stream_profiles = []
-# 填写聊天流即启用该聊天流。条数填 0、额外提示词留空则用上面的默认值。
+# 填写聊天流即启用该聊天流。条数、额外提示词按该聊天流自己的配置生效。
 # [[share.stream_profiles]]
 # stream = "qq:private:123456"
 # count_min = 2
@@ -55,11 +52,10 @@ patrol_interval_seconds = 60
 cooldown_seconds = 180
 silence_start = "00:00"
 silence_end = "07:30"
-miss_tolerance_minutes = 30
 
 # [prompts] 各提示词可在 WebUI 中整段修改。留空则使用内置默认值。
 # 占位符：{date} {weekday} {now} {timezone} {bot_nickname} {persona}
-# {history} {knowledge} {yesterday_tail} {schedule_json} {share_json}
-# {recent_schedule} {user_request} {wake_time} {sleep_time}
+# {history} {knowledge} {yesterday_tail} {recent_days_schedule} {schedule_json} {share_json}
+# {recent_schedule} {user_request} {wake_time} {sleep_time} {recent_days}
 # {activity_count_min} {activity_count_max} {share_count_min} {share_count_max}
-# {stream_info} {share_item} {target} {action}
+# {stream_info} {share_item} {target} {action} {silence_start} {silence_end}

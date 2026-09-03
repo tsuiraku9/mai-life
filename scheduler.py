@@ -12,12 +12,14 @@ from .config_model import MaiLifeConfig
 from .store import LifeDocument, ShareItem
 from .times import (
     combine_on_date,
-    is_in_time_window,
     is_valid_hhmm,
     next_daily_datetime,
     time_to_minutes,
     wall_clock_now,
 )
+
+# 到期后仍可补触发的内部宽限。巡检有间隔，且重启后不应把过期很久的提醒一次性发出。
+DEFAULT_MISS_TOLERANCE_MINUTES = 30
 
 logger = logging.getLogger("mailife.mai-life")
 
@@ -175,20 +177,10 @@ class LifeScheduler:
     async def _patrol_tick(self, config: MaiLifeConfig) -> None:
         if not config.plugin.enabled or not config.share.enabled or not config.share.wake_planner:
             return
-        if not is_valid_hhmm(config.share.silence_start) or not is_valid_hhmm(config.share.silence_end):
-            logger.error(
-                "静默时间配置无效: %s-%s",
-                config.share.silence_start,
-                config.share.silence_end,
-            )
-            return
         try:
             now = self._now(config)
         except ValueError:
             logger.exception("时区无效，跳过本次巡检")
-            return
-        current_hhmm = now.strftime("%H:%M")
-        if is_in_time_window(config.share.silence_start, config.share.silence_end, current_hhmm):
             return
         document = self._load_today(now)
         if document is None:
@@ -197,7 +189,7 @@ class LifeScheduler:
             status = share_due_status(
                 item,
                 now,
-                miss_tolerance_minutes=config.share.miss_tolerance_minutes,
+                miss_tolerance_minutes=DEFAULT_MISS_TOLERANCE_MINUTES,
             )
             if status == "missed" and not item.fired:
                 self._mark_share_fired(document.date, item.id, now)

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 import json
 import logging
 import re
 
-from .config_model import MaiLifeConfig, resolve_share_profile
+from .config_model import DEFAULT_SHARE_COUNT_MAX, DEFAULT_SHARE_COUNT_MIN, MaiLifeConfig, resolve_share_profile
 from .prompts import (
     DEFAULT_MODIFY_SYSTEM,
     DEFAULT_MODIFY_USER,
@@ -30,7 +31,7 @@ from .store import (
     shares_for_stream,
 )
 from .streams import format_stream_info, normalize_text, stream_session_id
-from .times import is_cross_day, weekday_cn
+from .times import is_cross_day, is_in_time_window, is_valid_hhmm, weekday_cn
 
 logger = logging.getLogger("mailife.mai-life")
 
@@ -97,6 +98,26 @@ def parse_shares(data: dict[str, Any]) -> list[ShareItem]:
     return result
 
 
+def drop_shares_in_silence(
+    shares: list[ShareItem],
+    silence_start: str,
+    silence_end: str,
+) -> list[ShareItem]:
+    """丢掉落在静默时段内的分享任务。开始与结束相同或时间非法则不过滤。"""
+
+    if not is_valid_hhmm(silence_start) or not is_valid_hhmm(silence_end):
+        return shares
+    if silence_start == silence_end:
+        return shares
+    kept: list[ShareItem] = []
+    for item in shares:
+        if is_valid_hhmm(item.time) and is_in_time_window(silence_start, silence_end, item.time):
+            logger.info("丢弃静默时段内的分享任务: %s %s", item.time, item.title)
+            continue
+        kept.append(item)
+    return kept
+
+
 def format_activities(activities: list[Activity]) -> str:
     """把活动列表格式化成可读文本。"""
 
@@ -127,6 +148,9 @@ def format_shares(shares: list[ShareItem]) -> str:
     return "\n".join(lines)
 
 
+MAX_RECENT_SCHEDULE_DAYS = 14
+
+
 def yesterday_tail_text(document: LifeDocument | None) -> str:
     """昨日尾部活动，供今天衔接。"""
 
@@ -141,6 +165,54 @@ def yesterday_tail_text(document: LifeDocument | None) -> str:
     if is_cross_day(last.start, last.end):
         lines.append(f"昨日最后一项 {last.start}-{last.end} {last.title} 会跨到今天，今天不要再写它。")
     return "\n".join(lines)
+
+
+def load_recent_schedule_documents(
+    load_date: Callable[[str], LifeDocument | None],
+    now: datetime,
+    days: int,
+) -> list[LifeDocument]:
+    """从昨天往前取出有日程的记录，最远不超过 MAX_RECENT_SCHEDULE_DAYS 天。"""
+
+    count = max(0, min(MAX_RECENT_SCHEDULE_DAYS, int(days)))
+    documents: list[LifeDocument] = []
+    for offset in range(count, 0, -1):
+        date = (now - timedelta(days=offset)).strftime("%Y-%m-%d")
+        document = load_date(date)
+        if document is not None and document.activities:
+            documents.append(document)
+    return documents
+
+
+def recent_days_schedule_text(documents: list[LifeDocument]) -> str:
+    """把近几日完整日程写成给模型看的文本，从早到晚排列。"""
+
+    if not documents:
+        return "（无近几日日程）"
+    parts: list[str] = []
+    for document in documents:
+        try:
+            day = datetime.strptime(document.date, "%Y-%m-%d")
+            heading = f"{document.date} 星期{weekday_cn(day)}"
+        except ValueError:
+            heading = document.date
+        parts.append(f"{heading}：\n{format_activities(document.activities)}")
+    return "\n\n".join(parts)
+
+
+def attach_recent_days_block(template: str, rendered: str, recent_text: str) -> str:
+    """旧提示词没有近几日占位符时，把近几日日程插到生成要求前面。"""
+
+    if "{recent_days_schedule}" in template:
+        return rendered
+    text = str(recent_text or "").strip()
+    if not text or text.startswith("（"):
+        return rendered
+    block = f"【近几日日程】\n以下是最近几天的安排，今天不要生成几乎相同的日程。\n{text}\n\n"
+    marker = "【生成要求】"
+    if marker in rendered:
+        return rendered.replace(marker, block + marker, 1)
+    return f"{rendered.rstrip()}\n\n{block}".rstrip() + "\n"
 
 
 class LifeGenerator:
@@ -181,6 +253,13 @@ class LifeGenerator:
         )
         yesterday = self.store.load((now - timedelta(days=1)).strftime("%Y-%m-%d"))
         values["yesterday_tail"] = yesterday_tail_text(yesterday)
+        recent_days = max(0, int(config.schedule.recent_days))
+        values["recent_days"] = str(recent_days)
+        if recent_days > 0:
+            recent_docs = load_recent_schedule_documents(self.store.load, now, recent_days)
+            values["recent_days_schedule"] = recent_days_schedule_text(recent_docs)
+        else:
+            values["recent_days_schedule"] = "（未附带近几日日程）"
 
         document = existing or LifeDocument(
             date=date,
@@ -317,6 +396,8 @@ class LifeGenerator:
             "history": history or "（无）",
             "knowledge": knowledge or "（无）",
             "yesterday_tail": "（无）",
+            "recent_days": "0",
+            "recent_days_schedule": "（无）",
             "schedule_json": "{}",
             "share_json": "{}",
             "recent_schedule": "（无）",
@@ -325,8 +406,10 @@ class LifeGenerator:
             "sleep_time": config.schedule.sleep_time,
             "activity_count_min": str(config.schedule.activity_count_min),
             "activity_count_max": str(config.schedule.activity_count_max),
-            "share_count_min": str(config.share.count_min),
-            "share_count_max": str(config.share.count_max),
+            "share_count_min": str(DEFAULT_SHARE_COUNT_MIN),
+            "share_count_max": str(DEFAULT_SHARE_COUNT_MAX),
+            "silence_start": config.share.silence_start,
+            "silence_end": config.share.silence_end,
             "stream_info": "",
             "share_item": "",
             "target": "",
@@ -337,9 +420,11 @@ class LifeGenerator:
 
     async def _generate_activities(self, config: MaiLifeConfig, values: dict[str, str]) -> list[Activity]:
         system_prompt = choose_template(config.prompts.schedule_system, DEFAULT_SCHEDULE_SYSTEM)
-        user_prompt = render_template(
-            choose_template(config.prompts.schedule_user, DEFAULT_SCHEDULE_USER),
-            values,
+        template = choose_template(config.prompts.schedule_user, DEFAULT_SCHEDULE_USER)
+        user_prompt = attach_recent_days_block(
+            template,
+            render_template(template, values),
+            values.get("recent_days_schedule", ""),
         )
         data = await self._ask_json(config, system_prompt, user_prompt, retries=1)
         if data is None:
@@ -400,7 +485,17 @@ class LifeGenerator:
         data = await self._ask_json(config, system_prompt, user_prompt, retries=1)
         if data is None:
             return []
-        return parse_shares(data)
+        shares = parse_shares(data)
+        kept = drop_shares_in_silence(
+            shares,
+            config.share.silence_start,
+            config.share.silence_end,
+        )
+        if shares and not kept:
+            logger.warning("分享任务全部落在静默时段内，已全部丢弃")
+        elif len(kept) < len(shares):
+            logger.info("已丢弃 %s 条静默时段内的分享任务", len(shares) - len(kept))
+        return kept
 
     async def _ask_json(
         self,

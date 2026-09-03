@@ -26,10 +26,11 @@ MaiBot 第三方插件：每天按可配置提示词生成角色日程，以及�
 |------|------|
 | plugin.enabled | 总开关，默认关闭 |
 | generation | 每日生成时刻、时区、模型、是否读人设/聊天/记忆 |
+| generation.knowledge_window_hours | 记忆检索时间窗（小时），0 表示不限时间 |
 | schedule.allowed_streams | 启用日程注入与查询/修改的聊天流 |
-| share.stream_profiles | 启用分享的聊天流；每项可覆盖条数和额外提示词，留空/0 则用默认值 |
-| share.count_min / count_max | 聊天流未单独填写条数时的默认生成条数 |
-| share.extra_prompt | 聊天流未单独填写时的默认额外提示词 |
+| schedule.recent_days | 生成日程时附带最近几天的已有日程，0 表示不附带 |
+| share.stream_profiles | 启用分享的聊天流；每项各自配置条数和额外提示词 |
+| share.silence_start / silence_end | 静默时段，生成分享任务时不会把提醒安排在这个区间 |
 | prompts | 日程生成、分享生成、修改、注入、唤醒意图的提示词 |
 
 白名单写法：
@@ -44,7 +45,7 @@ MaiBot 第三方插件：每天按可配置提示词生成角色日程，以及�
 
 ### 提示词占位符
 
-`{date}` `{weekday}` `{now}` `{timezone}` `{bot_nickname}` `{persona}` `{history}` `{knowledge}` `{yesterday_tail}` `{schedule_json}` `{share_json}` `{recent_schedule}` `{user_request}` `{wake_time}` `{sleep_time}` `{activity_count_min}` `{activity_count_max}` `{share_count_min}` `{share_count_max}` `{stream_info}` `{share_item}` `{target}` `{action}` `{extra_prompt}` `{stream_id}`
+`{date}` `{weekday}` `{now}` `{timezone}` `{bot_nickname}` `{persona}` `{history}` `{knowledge}` `{yesterday_tail}` `{recent_days}` `{recent_days_schedule}` `{schedule_json}` `{share_json}` `{recent_schedule}` `{user_request}` `{wake_time}` `{sleep_time}` `{activity_count_min}` `{activity_count_max}` `{share_count_min}` `{share_count_max}` `{silence_start}` `{silence_end}` `{stream_info}` `{share_item}` `{target}` `{action}` `{extra_prompt}` `{stream_id}`
 
 未知占位符会原样保留。配置项留空则回退到内置默认模板。
 

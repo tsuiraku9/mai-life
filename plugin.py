@@ -361,7 +361,7 @@ class MaiLifePlugin(MaiBotPlugin):
         want_share = scope in {"share", "both"}
         if want_schedule and not session_allowed(session_id, self.config.schedule.allowed_streams, streams):
             want_schedule = False
-        share_streams = await self._cached_streams(self.config.share.stream_discovery_platform)
+        share_streams = await self._cached_streams("all_platforms")
         if want_share and not session_allowed(session_id, share_allowlist(self.config.share), share_streams):
             want_share = False
         if scope == "schedule" and not want_schedule:
@@ -419,7 +419,7 @@ class MaiLifePlugin(MaiBotPlugin):
             ):
                 return {"success": False, "content": "当前聊天流未启用日程功能"}
         else:
-            streams = await self._cached_streams(self.config.share.stream_discovery_platform)
+            streams = await self._cached_streams("all_platforms")
             if not self.config.share.enabled or not session_allowed(
                 session_id, share_allowlist(self.config.share), streams
             ):
@@ -571,7 +571,7 @@ class MaiLifePlugin(MaiBotPlugin):
         }
 
     async def _list_share_streams(self) -> list[dict[str, Any]]:
-        streams = await self._cached_streams(self.config.share.stream_discovery_platform)
+        streams = await self._cached_streams("all_platforms")
         return filter_streams(streams, share_allowlist(self.config.share))
 
     async def _cached_streams(self, platform: str) -> list[dict[str, Any]]:
@@ -654,10 +654,12 @@ class MaiLifePlugin(MaiBotPlugin):
         if not config.include_knowledge or config.knowledge_search_limit <= 0:
             return ""
         try:
-            result = await self.ctx.knowledge.search(
-                "角色最近的习惯、约定和日程相关记忆",
+            payload = knowledge_search_args(
+                self._now(),
                 limit=config.knowledge_search_limit,
+                window_hours=config.knowledge_window_hours,
             )
+            result = await self.ctx.call_capability("knowledge.search", **payload)
         except Exception:
             logger.exception("知识库检索失败")
             return ""
@@ -666,27 +668,20 @@ class MaiLifePlugin(MaiBotPlugin):
         return normalize_text(result)
 
     async def _refresh_bot_profile(self) -> None:
-        if not self.config.generation.include_persona:
-            self._cached_persona = self.config.generation.extra_persona.strip()
-        else:
-            system_persona = ""
-            source = self.config.generation.persona_source
-            if source in {"system", "both"}:
-                try:
-                    system_persona = normalize_text(
-                        await self.ctx.config.get("personality.personality", "")
-                    )
-                except Exception:
-                    logger.exception("读取主程序人设失败")
-            extra = self.config.generation.extra_persona.strip()
-            if source == "extra":
-                self._cached_persona = extra
-            elif source == "system":
-                self._cached_persona = system_persona
-            elif system_persona and extra:
-                self._cached_persona = f"{system_persona}\n\n补充设定：{extra}"
-            else:
-                self._cached_persona = system_persona or extra
+        extra = self.config.generation.extra_persona.strip()
+        system_persona = ""
+        if self.config.generation.include_persona:
+            try:
+                system_persona = normalize_text(
+                    await self.ctx.config.get("personality.personality", "")
+                )
+            except Exception:
+                logger.exception("读取主程序人设失败")
+        self._cached_persona = compose_persona(
+            include_system=self.config.generation.include_persona,
+            system_persona=system_persona,
+            extra_persona=extra,
+        )
         try:
             nickname = normalize_text(await self.ctx.config.get("bot.nickname", ""))
         except Exception:
@@ -719,6 +714,43 @@ class MaiLifePlugin(MaiBotPlugin):
         if not stream_id:
             return
         await self.ctx.send.text(text, stream_id)
+
+
+KNOWLEDGE_SEARCH_QUERY = "角色最近的习惯、约定和日程相关记忆"
+
+
+def knowledge_search_args(
+    now: datetime,
+    *,
+    limit: int,
+    window_hours: int,
+) -> dict[str, Any]:
+    """组装记忆检索参数。窗口大于 0 时走 hybrid 并带上时间范围。"""
+
+    payload: dict[str, Any] = {
+        "query": KNOWLEDGE_SEARCH_QUERY,
+        "limit": max(1, int(limit)),
+    }
+    hours = int(window_hours)
+    if hours <= 0:
+        return payload
+    end = now.timestamp()
+    payload["mode"] = "hybrid"
+    payload["time_start"] = end - hours * 3600
+    payload["time_end"] = end
+    return payload
+
+
+def compose_persona(*, include_system: bool, system_persona: str, extra_persona: str) -> str:
+    """读入人设开启时拼接主程序人设与补充人设，关闭时只用补充人设。"""
+
+    extra = str(extra_persona or "").strip()
+    if not include_system:
+        return extra
+    system = str(system_persona or "").strip()
+    if system and extra:
+        return f"{system}\n\n补充设定：{extra}"
+    return system or extra
 
 
 def create_plugin() -> MaiLifePlugin:

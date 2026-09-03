@@ -24,6 +24,9 @@ DEFAULT_SCHEDULE_USER = """【日期】{date} 星期{weekday} 时区 {timezone} 
 【相关聊天】
 {history}
 
+【近几日日程】
+{recent_days_schedule}
+
 【昨日收束】
 {yesterday_tail}
 
@@ -32,6 +35,7 @@ DEFAULT_SCHEDULE_USER = """【日期】{date} 星期{weekday} 时区 {timezone} 
 - 每条活动需要 start、end、title，可选 notes。时间为 HH:MM。
 - 若活动跨过午夜，允许 start 晚于 end，例如 23:30-01:00 表示次日 01:00 结束。
 - 昨天已经跨到今天的活动不要再写一遍，从它结束后的新状态开始。
+- 参考近几日日程，今天不要生成几乎相同的安排；作息可以稳定，具体做事、出门和空闲要有变化。
 - 严格输出：{"activities":[{"start":"HH:MM","end":"HH:MM","title":"...","notes":"..."}]}
 """
 
@@ -41,6 +45,7 @@ DEFAULT_SHARE_SYSTEM = """你是角色分享任务规划助手。根据今天的
 DEFAULT_SHARE_USER = """【日期】{date} 星期{weekday} 现在 {now}
 【角色名】{bot_nickname}
 【数量】生成 {share_count_min} 到 {share_count_max} 条分享任务。
+【静默时段】{silence_start} 到 {silence_end}。不要把任何分享任务的 time 安排在这个区间内（可跨天）。开始与结束相同表示不设静默时段。
 
 【人设】
 {persona}
@@ -61,7 +66,7 @@ DEFAULT_SHARE_USER = """【日期】{date} 星期{weekday} 现在 {now}
 - 这些分享任务只给当前聊天流使用，内容要贴合这个聊天流的关系与语境。
 - 每条分享任务是角色可能在这个聊天里随口提起的小事，不要写成系统通知或闹钟。
 - 每条需要 time（HH:MM）、title，可选 hint、intent。
-- time 应落在角色清醒时段，错开密集安排。
+- time 应落在角色清醒时段，错开密集安排，且不得落在静默时段内。
 - intent 是唤醒规划器时给规划器看的意图，说明「可以考虑分享什么」，并强调不要像播报。
 - 严格输出：{"shares":[{"time":"HH:MM","title":"...","hint":"...","intent":"..."}]}
 """

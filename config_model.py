@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 from maibot_sdk import Field, PluginConfigBase
 from pydantic import model_validator
@@ -94,7 +94,7 @@ class GenerationSection(PluginConfigBase):
     )
     include_persona: bool = Field(
         default=True,
-        description="生成时是否读入人设",
+        description="开启时读取 MaiBot 人设，并与下方补充人设拼接；关闭时只使用补充人设",
         json_schema_extra=_ui("读入人设"),
     )
     include_history: bool = Field(
@@ -107,14 +107,9 @@ class GenerationSection(PluginConfigBase):
         description="生成时是否检索记忆",
         json_schema_extra=_ui("检索记忆"),
     )
-    persona_source: Literal["system", "extra", "both"] = Field(
-        default="both",
-        description="system 用主程序人格，extra 用下方补充人设，both 拼接两者",
-        json_schema_extra=_ui("人设来源"),
-    )
     extra_persona: str = Field(
         default="",
-        description="补充人设，仅在人设来源为 extra 或 both 时使用",
+        description="补充人设。读入人设开启时拼到主程序人设后面，关闭时作为唯一人设",
         json_schema_extra=_ui("补充人设", textarea=True),
     )
     history_message_limit: int = Field(
@@ -131,6 +126,11 @@ class GenerationSection(PluginConfigBase):
         default=5,
         description="检索记忆条数，0 表示不检索",
         json_schema_extra=_ui("记忆检索条数"),
+    )
+    knowledge_window_hours: int = Field(
+        default=168,
+        description="只检索最近多少小时内的记忆，0 表示不限时间",
+        json_schema_extra=_ui("记忆时间窗口（小时）"),
     )
     history_stream_ids: list[str] = Field(
         default_factory=list,
@@ -181,6 +181,11 @@ class ScheduleSection(PluginConfigBase):
         description="角色通常入睡的时间",
         json_schema_extra=_ui("入睡时间", placeholder="01:00"),
     )
+    recent_days: int = Field(
+        default=3,
+        description="生成日程时附带最近几天的已有日程，避免每天安排雷同。0 表示不附带",
+        json_schema_extra=_ui("参考最近天数"),
+    )
     recent_inject_count: int = Field(
         default=3,
         description="每次规划时注入最近几条日程",
@@ -193,8 +198,12 @@ class ScheduleSection(PluginConfigBase):
     )
 
 
+DEFAULT_SHARE_COUNT_MIN = 3
+DEFAULT_SHARE_COUNT_MAX = 6
+
+
 class ShareStreamProfile(PluginConfigBase):
-    """单个聊天流的分享启用项，可覆盖条数和额外提示词。"""
+    """单个聊天流的分享启用项，条数和额外提示词只在这里配置。"""
 
     stream: str = Field(
         default="",
@@ -202,13 +211,13 @@ class ShareStreamProfile(PluginConfigBase):
         json_schema_extra=_ui("聊天流", placeholder="qq:private:123"),
     )
     count_min: int = Field(
-        default=0,
-        description="该聊天流每天最少生成几条。0 表示使用默认下限",
+        default=DEFAULT_SHARE_COUNT_MIN,
+        description="该聊天流每天最少生成几条分享任务",
         json_schema_extra=_ui("生成条数下限"),
     )
     count_max: int = Field(
-        default=0,
-        description="该聊天流每天最多生成几条。0 表示使用默认上限",
+        default=DEFAULT_SHARE_COUNT_MAX,
+        description="该聊天流每天最多生成几条分享任务",
         json_schema_extra=_ui("生成条数上限"),
     )
     extra_prompt: str = Field(
@@ -232,55 +241,53 @@ class ShareSection(PluginConfigBase):
     )
     stream_profiles: list[ShareStreamProfile] = Field(
         default_factory=list,
-        description="填写聊天流即启用该聊天流的分享生成和到点唤醒，每个聊天流单独生成一份。条数填 0、额外提示词留空则使用下面的默认值。支持 all、session:<id>、<platform>:private:<id>、<platform>:<user_id>",
+        description="填写聊天流即启用该聊天流的分享生成和到点唤醒，每个聊天流单独生成一份。条数、额外提示词按该聊天流自己的配置生效。支持 all、session:<id>、<platform>:private:<id>、<platform>:<user_id>",
         json_schema_extra=_ui("启用的聊天流"),
-    )
-    stream_discovery_platform: str = Field(
-        default="all_platforms",
-        description="解析白名单时扫描的平台，all_platforms 表示所有平台",
-        json_schema_extra=_ui("扫描平台"),
-    )
-    count_min: int = Field(
-        default=3,
-        description="聊天流未单独填写条数时使用的默认下限",
-        json_schema_extra=_ui("默认生成条数下限"),
-    )
-    count_max: int = Field(
-        default=6,
-        description="聊天流未单独填写条数时使用的默认上限",
-        json_schema_extra=_ui("默认生成条数上限"),
-    )
-    extra_prompt: str = Field(
-        default="",
-        description="聊天流未单独填写额外提示词时使用的默认值",
-        json_schema_extra=_ui("默认额外提示词", textarea=True),
     )
 
     @model_validator(mode="before")
     @classmethod
-    def _merge_legacy_allowed_streams(cls, data: Any) -> Any:
-        """把旧配置里的 share.allowed_streams 并进 stream_profiles。"""
+    def _merge_legacy_share_fields(cls, data: Any) -> Any:
+        """兼容旧配置：allowed_streams、以及已删除的全局条数/额外提示词。"""
 
         if not isinstance(data, dict):
             return data
-        allowed_raw = data.get("allowed_streams")
-        if not isinstance(allowed_raw, list):
-            return data
-        allowed = [str(item).strip() for item in allowed_raw if str(item).strip()]
-        if not allowed:
-            return data
-        profiles = list(data.get("stream_profiles") or [])
-        existing: set[str] = set()
-        for profile in profiles:
-            if isinstance(profile, dict):
-                existing.add(str(profile.get("stream") or "").strip())
-            else:
-                existing.add(str(getattr(profile, "stream", "") or "").strip())
-        missing = [item for item in allowed if item not in existing]
-        if not missing:
-            return data
         merged = dict(data)
-        merged["stream_profiles"] = profiles + [{"stream": item} for item in missing]
+        profiles = list(merged.get("stream_profiles") or [])
+
+        allowed_raw = merged.get("allowed_streams")
+        if isinstance(allowed_raw, list):
+            allowed = [str(item).strip() for item in allowed_raw if str(item).strip()]
+            existing: set[str] = set()
+            for profile in profiles:
+                if isinstance(profile, dict):
+                    existing.add(str(profile.get("stream") or "").strip())
+                else:
+                    existing.add(str(getattr(profile, "stream", "") or "").strip())
+            missing = [item for item in allowed if item not in existing]
+            if missing:
+                profiles = profiles + [{"stream": item} for item in missing]
+
+        legacy_min = merged.get("count_min")
+        legacy_max = merged.get("count_max")
+        legacy_extra = str(merged.get("extra_prompt") or "").strip()
+        if profiles and (legacy_min or legacy_max or legacy_extra):
+            updated: list[Any] = []
+            for profile in profiles:
+                if not isinstance(profile, dict):
+                    updated.append(profile)
+                    continue
+                item = dict(profile)
+                if not int(item.get("count_min") or 0) and legacy_min:
+                    item["count_min"] = legacy_min
+                if not int(item.get("count_max") or 0) and legacy_max:
+                    item["count_max"] = legacy_max
+                if not str(item.get("extra_prompt") or "").strip() and legacy_extra:
+                    item["extra_prompt"] = legacy_extra
+                updated.append(item)
+            profiles = updated
+
+        merged["stream_profiles"] = profiles
         return merged
 
     wake_planner: bool = Field(
@@ -300,18 +307,13 @@ class ShareSection(PluginConfigBase):
     )
     silence_start: str = Field(
         default="00:00",
-        description="静默开始时间，该时段不唤醒规划器",
+        description="静默开始时间。生成分享任务时不会把提醒安排在这个时段内，已有提醒仍会到点发出",
         json_schema_extra=_ui("静默开始", placeholder="00:00"),
     )
     silence_end: str = Field(
         default="07:30",
-        description="静默结束时间",
+        description="静默结束时间。开始与结束相同表示不设静默时段",
         json_schema_extra=_ui("静默结束", placeholder="07:30"),
-    )
-    miss_tolerance_minutes: int = Field(
-        default=30,
-        description="过点后仍可补触发的宽限时间",
-        json_schema_extra=_ui("过点宽限（分钟）"),
     )
 
 
@@ -339,7 +341,7 @@ class PromptSection(PluginConfigBase):
     )
     share_user: str = Field(
         default=DEFAULT_SHARE_USER,
-        description="分享任务生成的用户提示词，可使用 {extra_prompt} {stream_info} 等占位符",
+        description="分享任务生成的用户提示词，可使用 {extra_prompt} {stream_info} {silence_start} {silence_end} 等占位符",
         json_schema_extra=_ui("分享用户提示词", textarea=True),
     )
     modify_system: str = Field(
@@ -382,6 +384,15 @@ def share_allowlist(share: ShareSection) -> list[str]:
     return normalize_allowlist([profile.stream for profile in share.stream_profiles])
 
 
+def _share_counts(count_min: int, count_max: int) -> tuple[int, int]:
+    """条数填 0 时回落到内置默认值，并保证上限不小于下限。"""
+
+    resolved_min = int(count_min) if int(count_min) > 0 else DEFAULT_SHARE_COUNT_MIN
+    resolved_max = int(count_max) if int(count_max) > 0 else DEFAULT_SHARE_COUNT_MAX
+    resolved_min = max(1, resolved_min)
+    return resolved_min, max(resolved_min, resolved_max)
+
+
 def resolve_share_profile(share: ShareSection, stream: dict[str, Any]) -> tuple[int, int, str]:
     """解析某个聊天流的分享条数和额外提示词。具体聊天流优先于 all。"""
 
@@ -401,12 +412,8 @@ def resolve_share_profile(share: ShareSection, stream: dict[str, Any]) -> tuple[
             specific = profile
     profile = specific or wildcard
     if profile is None:
-        count_min = max(1, int(share.count_min))
-        count_max = max(count_min, int(share.count_max))
-        return count_min, count_max, str(share.extra_prompt or "").strip()
-    count_min = profile.count_min if profile.count_min > 0 else share.count_min
-    count_max = profile.count_max if profile.count_max > 0 else share.count_max
-    extra = str(profile.extra_prompt or "").strip() or str(share.extra_prompt or "").strip()
-    count_min = max(1, int(count_min))
-    count_max = max(count_min, int(count_max))
+        count_min, count_max = _share_counts(DEFAULT_SHARE_COUNT_MIN, DEFAULT_SHARE_COUNT_MAX)
+        return count_min, count_max, ""
+    count_min, count_max = _share_counts(profile.count_min, profile.count_max)
+    extra = str(profile.extra_prompt or "").strip()
     return count_min, count_max, extra
