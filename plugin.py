@@ -25,7 +25,7 @@ from maibot_sdk.types import (
 )
 
 from .config_model import MaiLifeConfig, share_allowlist
-from .generator import LifeGenerator, format_activities, format_shares
+from .generator import LifeGenerator, format_activities, format_shares, format_shares_by_stream
 from .injector import build_inject_text, inject_into_items, inject_into_messages
 from .prompts import DEFAULT_WAKE_INTENT_TEMPLATE, choose_template, render_template
 from .scheduler import LifeScheduler
@@ -258,13 +258,15 @@ class MaiLifePlugin(MaiBotPlugin):
 
     @Command("mai_life_help", description="查看麦麦生活命令", pattern=r"^/mai_life_help$")
     async def handle_help(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
-        del kwargs
+        denied = await self._require_command_admin(stream_id, kwargs)
+        if denied is not None:
+            return denied
         text = (
-            "麦麦生活命令：\n"
+            "麦麦生活命令（仅管理员）：\n"
             "/mai_life_help 查看帮助\n"
             "/mai_life_status 查看开关、条数和下次生成时间\n"
             "/mai_life_generate 立即生成今日日程和分享任务\n"
-            "/mai_life_show 查看今日日程和分享任务\n"
+            "/mai_life_show 查看今日日程和所有聊天流的分享任务\n"
             "/mai_life_wake 立即对当前聊天流唤醒规划器（测试用）"
         )
         await self._reply(stream_id, text)
@@ -272,27 +274,26 @@ class MaiLifePlugin(MaiBotPlugin):
 
     @Command("mai_life_status", description="查看麦麦生活状态", pattern=r"^/mai_life_status$")
     async def handle_status(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
-        del kwargs
+        denied = await self._require_command_admin(stream_id, kwargs)
+        if denied is not None:
+            return denied
         now = self._now()
         document = self._load_today(now)
         activity_count = len(document.activities) if document else 0
         share_count = len(document.shares) if document else 0
-        pending = 0
-        current_shares: list[ShareItem] = []
-        if document:
-            current_shares = shares_for_stream(document, stream_id) if stream_id else document.shares
-            pending = sum(1 for item in current_shares if not item.fired)
-            share_count = len(current_shares)
+        pending = sum(1 for item in document.shares if not item.fired) if document else 0
+        stream_count = len({item.stream_id for item in document.shares if item.stream_id}) if document else 0
         text = (
             f"插件启用：{'是' if self.config.plugin.enabled else '否'}\n"
+            f"管理员：{len(self.config.plugin.admin_user_ids)} 人\n"
             f"日程功能：{'是' if self.config.schedule.enabled else '否'}，"
             f"白名单 {len(self.config.schedule.allowed_streams)} 项\n"
             f"分享功能：{'是' if self.config.share.enabled else '否'}，"
             f"白名单 {len(share_allowlist(self.config.share))} 项\n"
             f"今日日期：{now.strftime('%Y-%m-%d')} {now.strftime('%H:%M')}\n"
             f"今日日程：{activity_count} 条\n"
-            f"当前聊天流分享：{share_count} 条，未提醒 {pending} 条\n"
-            f"全部聊天流分享：{len(document.shares) if document else 0} 条\n"
+            f"分享任务：{share_count} 条，未提醒 {pending} 条，"
+            f"涉及 {stream_count} 个聊天流\n"
             f"每日生成时刻：{self.config.generation.time}"
         )
         await self._reply(stream_id, text)
@@ -300,7 +301,9 @@ class MaiLifePlugin(MaiBotPlugin):
 
     @Command("mai_life_generate", description="立即生成今日生活记录", pattern=r"^/mai_life_generate$")
     async def handle_generate(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
-        del kwargs
+        denied = await self._require_command_admin(stream_id, kwargs)
+        if denied is not None:
+            return denied
         if not self.config.plugin.enabled:
             await self._reply(stream_id, "麦麦生活未启用")
             return True, "插件未启用", 2
@@ -308,25 +311,29 @@ class MaiLifePlugin(MaiBotPlugin):
         await self._reply(stream_id, "正在生成今日日程和分享任务…")
         return True, "已开始生成", 2
 
-    @Command("mai_life_show", description="查看今日日程和分享任务", pattern=r"^/mai_life_show$")
+    @Command("mai_life_show", description="查看今日日程和所有聊天流的分享任务", pattern=r"^/mai_life_show$")
     async def handle_show(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
-        del kwargs
+        denied = await self._require_command_admin(stream_id, kwargs)
+        if denied is not None:
+            return denied
         now = self._now()
         document = self._load_today(now)
         if document is None:
             await self._reply(stream_id, "今天还没有生活记录。可用 /mai_life_generate 生成。")
             return True, "今日无记录", 2
-        current_shares = shares_for_stream(document, stream_id) if stream_id else document.shares
+        streams = await self._cached_streams("all_platforms")
         text = (
             f"{document.date} 日程：\n{format_activities(document.activities)}\n\n"
-            f"{document.date} 当前聊天流分享任务：\n{format_shares(current_shares)}"
+            f"{document.date} 全聊天流分享任务：\n{format_shares_by_stream(document.shares, streams)}"
         )
         await self._reply(stream_id, text)
         return True, "已发送今日记录", 2
 
     @Command("mai_life_wake", description="立即唤醒当前聊天流的规划器", pattern=r"^/mai_life_wake$")
     async def handle_wake(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
-        del kwargs
+        denied = await self._require_command_admin(stream_id, kwargs)
+        if denied is not None:
+            return denied
         if not stream_id:
             return True, "无法获取当前聊天流", 2
         if not self.config.plugin.enabled:
@@ -710,6 +717,24 @@ class MaiLifePlugin(MaiBotPlugin):
             or normalize_text(kwargs.get("session_id"))
         )
 
+    async def _require_command_admin(
+        self, stream_id: str, kwargs: dict[str, Any]
+    ) -> tuple[bool, str, int] | None:
+        platform, user_id, is_local = command_caller_identity(kwargs)
+        if is_admin_user(
+            platform,
+            user_id,
+            self.config.plugin.admin_user_ids,
+            is_local_operator=is_local,
+        ):
+            return None
+        if not self.config.plugin.admin_user_ids:
+            text = "尚未配置管理员，无法使用麦麦生活命令。请在插件设置中填写管理员。"
+        else:
+            text = "只有管理员可以使用麦麦生活命令"
+        await self._reply(stream_id, text)
+        return True, "没有权限", 2
+
     async def _reply(self, stream_id: str, text: str) -> None:
         if not stream_id:
             return
@@ -717,6 +742,63 @@ class MaiLifePlugin(MaiBotPlugin):
 
 
 KNOWLEDGE_SEARCH_QUERY = "角色最近的习惯、约定和日程相关记忆"
+
+
+def command_caller_identity(kwargs: dict[str, Any]) -> tuple[str, str, bool]:
+    """从命令调用上下文取出 platform、user_id，以及是否为本地控制台操作员。"""
+
+    message = kwargs.get("message")
+    message_dict = message if isinstance(message, dict) else {}
+    message_info = message_dict.get("message_info") if isinstance(message_dict.get("message_info"), dict) else {}
+    user_info = message_info.get("user_info") if isinstance(message_info.get("user_info"), dict) else {}
+    platform = (
+        normalize_text(kwargs.get("platform"))
+        or normalize_text(message_dict.get("platform"))
+        or normalize_text(message_info.get("platform"))
+    )
+    user_id = (
+        normalize_text(kwargs.get("user_id"))
+        or normalize_text(user_info.get("user_id"))
+        or normalize_text(message_dict.get("user_id"))
+    )
+    return platform, user_id, kwargs.get("is_local_operator") is True
+
+
+def is_admin_user(
+    platform: str,
+    user_id: str,
+    admin_user_ids: list[str] | None,
+    *,
+    is_local_operator: bool = False,
+) -> bool:
+    """判断命令调用者是否为管理员。本地控制台操作员始终通过。"""
+
+    if is_local_operator:
+        return True
+    user_id = normalize_text(user_id)
+    if not user_id:
+        return False
+    platform = normalize_text(platform)
+    for item in admin_user_ids or []:
+        configured = normalize_text(item)
+        if not configured:
+            continue
+        if ":" not in configured:
+            if not platform and configured == user_id:
+                return True
+            continue
+        configured_platform, configured_user_id = configured.split(":", 1)
+        configured_platform = configured_platform.strip()
+        configured_user_id = configured_user_id.strip()
+        if configured_user_id.lower().startswith("private:"):
+            configured_user_id = configured_user_id.split(":", 1)[1].strip()
+        if (
+            platform
+            and configured_platform.casefold() == platform.casefold()
+            and configured_user_id == user_id
+        ):
+            return True
+    return False
 
 
 def knowledge_search_args(

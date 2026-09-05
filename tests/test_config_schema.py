@@ -11,6 +11,7 @@ def test_webui_field_labels_are_chinese() -> None:
     assert sections["plugin"]["title"] == "插件"
     assert sections["share"]["title"] == "分享提醒"
     assert sections["plugin"]["fields"]["enabled"]["label"] == "启用插件"
+    assert sections["plugin"]["fields"]["admin_user_ids"]["label"] == "管理员"
     assert "count_min" not in sections["share"]["fields"]
     assert "count_max" not in sections["share"]["fields"]
     assert "extra_prompt" not in sections["share"]["fields"]

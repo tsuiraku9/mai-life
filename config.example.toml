@@ -3,7 +3,10 @@
 
 [plugin]
 enabled = false
-config_version = "1.0.0"
+config_version = "1.2.0"
+# 允许使用 /mai_life_* 命令的管理员。格式 platform:user_id，例如 qq:123456、webui:webui_user_xxx。
+# 名单为空时任何聊天用户都不能使用命令。本地控制台操作员始终可用。
+admin_user_ids = []
 
 [generation]
 time = "01:30"

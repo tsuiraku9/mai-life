@@ -44,9 +44,18 @@ class PluginSection(PluginConfigBase):
         json_schema_extra=_ui("启用插件"),
     )
     config_version: str = Field(
-        default="1.1.0",
+        default="1.2.0",
         description="配置结构版本，一般不用改",
         json_schema_extra=_ui("配置版本"),
+    )
+    admin_user_ids: list[str] = Field(
+        default_factory=list,
+        description="允许使用麦麦生活命令的用户。每项填写 platform:user_id，例如 qq:123456 或 webui:webui_user_xxx。名单为空时任何聊天用户都不能使用命令。本地控制台操作员始终可用。",
+        json_schema_extra=_ui(
+            "管理员",
+            placeholder="qq:123456",
+            hint="只有名单中的用户能使用 /mai_life_* 命令。本地控制台操作员始终可用。",
+        ),
     )
 
 

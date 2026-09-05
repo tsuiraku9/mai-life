@@ -148,6 +148,55 @@ def format_shares(shares: list[ShareItem]) -> str:
     return "\n".join(lines)
 
 
+def format_share_stream_label(stream: dict[str, Any] | None, stream_id: str) -> str:
+    """管理员查看用的聊天流标题。"""
+
+    session_id = stream_session_id(stream) if stream else normalize_text(stream_id)
+    if not session_id:
+        return "未绑定聊天流"
+    if not stream:
+        return f"聊天流 {session_id}"
+    platform = normalize_text(stream.get("platform"))
+    chat_type = normalize_text(stream.get("chat_type"))
+    group_id = normalize_text(stream.get("group_id"))
+    user_id = normalize_text(stream.get("user_id"))
+    bits = [f"聊天流 {session_id}"]
+    if platform:
+        bits.append(platform)
+    if chat_type == "group" and group_id:
+        bits.append(f"群 {group_id}")
+    elif user_id:
+        bits.append(f"用户 {user_id}")
+    elif chat_type:
+        bits.append(chat_type)
+    return " | ".join(bits)
+
+
+def format_shares_by_stream(
+    shares: list[ShareItem],
+    streams: list[dict[str, Any]] | None = None,
+) -> str:
+    """按聊天流分组展示分享任务。"""
+
+    if not shares:
+        return "（无）"
+    grouped: dict[str, list[ShareItem]] = {}
+    for item in shares:
+        grouped.setdefault(normalize_text(item.stream_id), []).append(item)
+    labels = {
+        stream_session_id(stream): format_share_stream_label(stream, stream_session_id(stream))
+        for stream in streams or []
+        if stream_session_id(stream)
+    }
+    parts: list[str] = []
+    for stream_id in sorted(grouped, key=lambda key: (key == "", key)):
+        header = labels.get(stream_id) if stream_id else "未绑定聊天流"
+        if not header:
+            header = format_share_stream_label(None, stream_id)
+        parts.append(f"{header}：\n{format_shares(grouped[stream_id])}")
+    return "\n\n".join(parts)
+
+
 MAX_RECENT_SCHEDULE_DAYS = 14
 
 

@@ -3,6 +3,7 @@ from datetime import datetime
 from mailife.generator import (
     attach_recent_days_block,
     drop_shares_in_silence,
+    format_shares_by_stream,
     load_recent_schedule_documents,
     parse_activities,
     parse_json_object,
@@ -52,6 +53,28 @@ def test_drop_shares_in_silence_window() -> None:
     assert drop_shares_in_silence(shares, "00:00", "00:00") == shares
     overnight = drop_shares_in_silence(shares, "23:00", "07:00")
     assert [item.title for item in overnight] == ["早餐"]
+
+
+def test_format_shares_by_stream_groups_all_chats() -> None:
+    shares = [
+        ShareItem(id="a", time="12:00", title="午饭", stream_id="stream-a"),
+        ShareItem(id="b", time="18:00", title="晚饭", stream_id="stream-b", hint="提一句"),
+        ShareItem(id="c", time="21:00", title="夜话", stream_id=""),
+    ]
+    streams = [
+        {"session_id": "stream-a", "platform": "qq", "chat_type": "private", "user_id": "111"},
+        {"session_id": "stream-b", "platform": "webui", "user_id": "webui_user_xxx"},
+    ]
+    text = format_shares_by_stream(shares, streams)
+    assert "午饭" in text
+    assert "晚饭" in text
+    assert "夜话" in text
+    assert "聊天流 stream-a | qq | 用户 111" in text
+    assert "聊天流 stream-b | webui | 用户 webui_user_xxx" in text
+    assert "未绑定聊天流" in text
+    assert text.index("stream-a") < text.index("stream-b")
+    assert text.index("stream-b") < text.index("未绑定聊天流")
+    assert format_shares_by_stream([]) == "（无）"
 
 
 def test_recent_days_schedule_text_oldest_first() -> None:

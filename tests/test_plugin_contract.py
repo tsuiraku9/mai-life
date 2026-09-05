@@ -1,7 +1,14 @@
 from datetime import datetime
 
 from mailife.config_model import MaiLifeConfig
-from mailife.plugin import MaiLifePlugin, compose_persona, create_plugin, knowledge_search_args
+from mailife.plugin import (
+    MaiLifePlugin,
+    command_caller_identity,
+    compose_persona,
+    create_plugin,
+    is_admin_user,
+    knowledge_search_args,
+)
 
 
 def test_create_plugin_and_lifecycle_methods() -> None:
@@ -60,3 +67,47 @@ def test_persona_source_removed_from_config() -> None:
     assert not hasattr(config.generation, "persona_source")
     assert config.generation.include_persona is True
     assert config.generation.extra_persona == "只要补充"
+
+
+def test_admin_user_ids_default_empty() -> None:
+    assert MaiLifeConfig().plugin.admin_user_ids == []
+
+
+def test_is_admin_user_matches_platform_user() -> None:
+    admins = ["qq:123456", "webui:webui_user_xxx"]
+    assert is_admin_user("qq", "123456", admins) is True
+    assert is_admin_user("QQ", "123456", admins) is True
+    assert is_admin_user("qq", "999", admins) is False
+    assert is_admin_user("discord", "123456", admins) is False
+    assert is_admin_user("webui", "webui_user_xxx", admins) is True
+    assert is_admin_user("qq", "123456", ["qq:private:123456"]) is True
+    assert is_admin_user("", "123456", ["123456"]) is True
+    assert is_admin_user("qq", "123456", ["123456"]) is False
+    assert is_admin_user("qq", "123456", []) is False
+    assert is_admin_user("qq", "123456", [], is_local_operator=True) is True
+    assert is_admin_user("", "", ["qq:123456"]) is False
+
+
+def test_command_caller_identity_reads_host_fields() -> None:
+    platform, user_id, is_local = command_caller_identity(
+        {
+            "platform": "qq",
+            "user_id": "123456",
+            "is_local_operator": False,
+            "message": {
+                "platform": "webui",
+                "message_info": {"user_info": {"user_id": "spoofed"}},
+            },
+        }
+    )
+    assert (platform, user_id, is_local) == ("qq", "123456", False)
+    nested_platform, nested_user, nested_local = command_caller_identity(
+        {
+            "is_local_operator": True,
+            "message": {
+                "platform": "webui",
+                "message_info": {"user_info": {"user_id": "webui_user_xxx"}},
+            },
+        }
+    )
+    assert (nested_platform, nested_user, nested_local) == ("webui", "webui_user_xxx", True)
