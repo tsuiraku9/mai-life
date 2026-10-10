@@ -71,7 +71,7 @@ DEFAULT_SHARE_USER = """【日期】{date} 星期{weekday} 现在 {now}
 - 严格输出：{"shares":[{"time":"HH:MM","title":"...","hint":"...","intent":"..."}]}
 """
 
-DEFAULT_MODIFY_SYSTEM = """你是角色生活记录维护助手。根据变更请求更新日程或分享任务。
+DEFAULT_MODIFY_SYSTEM = """你是角色生活日程维护助手。根据变更请求更新日程，不创建或修改定时任务。
 只输出 JSON，不要 Markdown 代码块，不要解释文字。"""
 
 DEFAULT_MODIFY_USER = """【日期】{date} 现在 {now}
@@ -83,9 +83,6 @@ DEFAULT_MODIFY_USER = """【日期】{date} 现在 {now}
 【当前日程】
 {schedule_json}
 
-【当前分享任务】
-{share_json}
-
 【当前聊天流】
 {stream_info}
 
@@ -93,9 +90,9 @@ DEFAULT_MODIFY_USER = """【日期】{date} 现在 {now}
 {persona}
 
 【要求】
-- 若目标是 schedule，输出完整 {"activities":[...]}，字段与现有日程相同。
-- 若目标是 share，输出完整 {"shares":[...]}，字段与现有分享任务相同。
-- add 表示加入一项并调整冲突；update 表示修改匹配项；delete 表示删除匹配项；replace_day 表示按请求重写当天该目标。
+- 输出完整 {"activities":[...]}，字段与现有日程相同，每项须包含合法 start、end、title。
+- add 表示加入一项并调整冲突；update 表示修改匹配项；delete 表示删除匹配项；replace_day 表示按请求重写当天日程。
+- 仅当 delete 请求确实删除所有活动时，才输出显式 {"activities":[]}；缺少 activities 或非法活动不是删除结果。
 - 不要无故清空未提及的项目。
 - 时间一律 HH:MM。
 """

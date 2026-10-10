@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 import asyncio
 import json
@@ -26,10 +26,12 @@ from maibot_sdk.types import (
 
 from .config_model import MaiLifeConfig, share_allowlist
 from .generator import LifeGenerator, format_activities, format_shares, format_shares_by_stream
-from .injector import build_inject_text, inject_into_items, inject_into_messages
+from .injector import build_inject_text, build_today_schedule_text, inject_into_items, inject_into_messages
 from .prompts import DEFAULT_WAKE_INTENT_TEMPLATE, choose_template, render_template
-from .scheduler import LifeScheduler
-from .store import LifeDocument, LifeStore, ShareItem, shares_for_stream
+from .scheduler import DEFAULT_MISS_TOLERANCE_MINUTES, LifeScheduler, share_due_status
+from .store import LifeDocument, LifeStore, ShareItem, shares_for_stream, task_due_at, task_state
+from .tasks import TaskManager, format_task_records
+from .tool_descriptions import DEFAULT_MODIFY_TOOL_DESCRIPTION, DEFAULT_QUERY_TOOL_DESCRIPTION
 from .streams import (
     filter_streams,
     format_stream_info,
@@ -37,19 +39,12 @@ from .streams import (
     session_allowed,
     stream_session_id,
 )
-from .times import wall_clock_now, weekday_cn
+from .times import parse_date, wall_clock_now, weekday_cn
 
 logger = logging.getLogger("mailife.mai-life")
 
-_QUERY_DESCRIPTION = (
-    "查询角色今天或指定日期的生活日程，以及计划在聊天中分享的事情和提醒时间。"
-    "当用户问在干什么、今天安排、待会要做什么、有没有要说的事时使用。"
-)
-_MODIFY_DESCRIPTION = (
-    "修改角色的生活日程或分享提醒时间。"
-    "当用户邀请角色改计划、加上一件事、取消分享、改提醒时间时使用。"
-    "修改后以工具返回为准，不要假装已经改了却没调用本工具。"
-)
+_QUERY_DESCRIPTION = DEFAULT_QUERY_TOOL_DESCRIPTION
+_MODIFY_DESCRIPTION = DEFAULT_MODIFY_TOOL_DESCRIPTION
 
 
 class MaiLifePlugin(MaiBotPlugin):
@@ -66,13 +61,38 @@ class MaiLifePlugin(MaiBotPlugin):
         self._generate_lock = asyncio.Lock()
         self._cached_persona = ""
         self._cached_nickname = "麦麦"
-        self._stream_cache: list[dict[str, Any]] = []
-        self._stream_cache_at: datetime | None = None
+        self._stream_cache: dict[str, tuple[datetime, list[dict[str, Any]]]] = {}
+        self._registered_tool_descriptions: tuple[str, str] | None = None
+        self._manual_generation_tasks: set[asyncio.Task[None]] = set()
+
+    def _tool_descriptions(self) -> tuple[str, str]:
+        # Runner 先注入配置再收集组件；未注入时仅用于离线组件探查。
+        config = self.config if self._plugin_config_instance is not None else MaiLifeConfig()
+        return (
+            choose_template(config.tools.query_description, DEFAULT_QUERY_TOOL_DESCRIPTION),
+            choose_template(config.tools.modify_description, DEFAULT_MODIFY_TOOL_DESCRIPTION),
+        )
+
+    def get_components(self) -> list[dict[str, Any]]:
+        components = super().get_components()
+        query, modify = self._tool_descriptions()
+        descriptions = {"mai_life_query": query, "mai_life_modify": modify}
+        for component in components:
+            if component["name"] in descriptions:
+                metadata = dict(component["metadata"])
+                metadata["description"] = descriptions[component["name"]]
+                metadata["brief_description"] = descriptions[component["name"]]
+                # Host 的 action 调用入口强制绑定当前流；普通 tool 入口仅补缺失值。
+                # 组件仍是 TOOL，Runner 使用同一 handler/结果协议，不读取 action_data 的目标流。
+                metadata["invoke_method"] = "plugin.invoke_action"
+                component["metadata"] = metadata
+        self._registered_tool_descriptions = (query, modify)
+        return components
 
     async def on_load(self) -> None:
         data_dir = self.ctx.paths.data_dir
         data_dir.mkdir(parents=True, exist_ok=True)
-        self._store = LifeStore(data_dir)
+        self._store = LifeStore(data_dir, now=self._now)
         self._generator = LifeGenerator(self.ctx, self._store)
         self._scheduler = LifeScheduler(
             get_config=lambda: self.config,
@@ -80,6 +100,7 @@ class MaiLifePlugin(MaiBotPlugin):
             load_today=self._load_today,
             fire_share=self._fire_share,
             mark_share_fired=self._mark_share_fired,
+            store=self._store,
         )
         await self._refresh_bot_profile()
         if self.config.plugin.enabled:
@@ -90,9 +111,18 @@ class MaiLifePlugin(MaiBotPlugin):
         else:
             logger.info("麦麦生活已加载，但 plugin.enabled=false，调度器未启动")
 
+    async def _stop_manual_generation(self) -> None:
+        tasks = list(self._manual_generation_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._manual_generation_tasks.clear()
+
     async def on_unload(self) -> None:
         if self._scheduler is not None:
             await self._scheduler.stop()
+        await self._stop_manual_generation()
         logger.info("麦麦生活已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, object], version: str) -> None:
@@ -102,6 +132,10 @@ class MaiLifePlugin(MaiBotPlugin):
             return
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             return
+        if self._registered_tool_descriptions != self._tool_descriptions():
+            logger.info("工具说明配置已保存；当前 SDK 不热更新组件元数据，需手动重载插件后规划器才会看到新说明")
+        if not self.config.plugin.enabled:
+            await self._stop_manual_generation()
         if self._scheduler is None:
             return
         if self.config.plugin.enabled:
@@ -146,6 +180,7 @@ class MaiLifePlugin(MaiBotPlugin):
             count=config.schedule.recent_inject_count,
             window_minutes=config.schedule.inject_window_minutes,
             template=config.prompts.inject_template,
+            yesterday=self._load_yesterday(now),
             extra_values={
                 "timezone": config.generation.timezone,
                 "bot_nickname": self._cached_nickname,
@@ -179,21 +214,22 @@ class MaiLifePlugin(MaiBotPlugin):
 
     @Tool(
         "mai_life_query",
-        brief_description="查询角色的日程和分享提醒时间",
+        brief_description=_QUERY_DESCRIPTION,
         detailed_description=_QUERY_DESCRIPTION,
         core_tool=True,
         parameters=[
             ToolParameterInfo(
                 name="date",
                 param_type=ToolParamType.STRING,
-                description="要查询的日期，YYYY-MM-DD，可留空表示今天",
+                description="YYYY-MM-DD；留空查今天日程/所有待处理任务；任务按到期日筛选",
                 required=False,
             ),
             ToolParameterInfo(
                 name="target",
                 param_type=ToolParamType.STRING,
-                description="查询范围：schedule、share 或 both，默认 both",
+                description="schedule=全局日程；share=当前聊天流统一任务；both=两者，默认 both",
                 required=False,
+                enum_values=["schedule", "share", "both"],
             ),
         ],
     )
@@ -206,32 +242,58 @@ class MaiLifePlugin(MaiBotPlugin):
 
     @Tool(
         "mai_life_modify",
-        brief_description="修改角色的日程或分享提醒时间",
+        brief_description=_MODIFY_DESCRIPTION,
         detailed_description=_MODIFY_DESCRIPTION,
         core_tool=True,
         parameters=[
             ToolParameterInfo(
-                name="target",
-                param_type=ToolParamType.STRING,
-                description="修改目标：schedule 或 share",
-                required=True,
+                name="target", param_type=ToolParamType.STRING,
+                description="schedule=生活日程；share=当前对话的自动分享与单次任务",
+                required=True, enum_values=["schedule", "share"],
             ),
             ToolParameterInfo(
-                name="action",
-                param_type=ToolParamType.STRING,
-                description="动作：add、update、delete 或 replace_day",
-                required=True,
+                name="action", param_type=ToolParamType.STRING,
+                description="share 支持 list/add/update/delete；schedule 支持 add/update/delete/replace_day",
+                required=True, enum_values=["list", "add", "update", "delete", "replace_day"],
             ),
             ToolParameterInfo(
-                name="request",
-                param_type=ToolParamType.STRING,
-                description="自然语言或 JSON 描述要改什么，例如「下午三点改成学习」",
-                required=True,
+                name="request", param_type=ToolParamType.STRING,
+                description="仅 schedule 必填：用自然语言描述日程变更",
+                required=False,
             ),
             ToolParameterInfo(
-                name="date",
-                param_type=ToolParamType.STRING,
-                description="要修改的日期，YYYY-MM-DD，可留空表示今天",
+                name="date", param_type=ToolParamType.STRING,
+                description="YYYY-MM-DD；日程默认今天；任务 list 按到期日筛选，update/delete 可填 owner_date，add 留空",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="task_id", param_type=ToolParamType.STRING,
+                description="任务 update/delete 必填：查询返回的 task_id",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="title", param_type=ToolParamType.STRING,
+                description="任务 add 必填：简短标题；update 可修改",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="intent", param_type=ToolParamType.STRING,
+                description="任务 add 必填：到期要做什么；提醒写明约定，分享写明话题",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="run_at", param_type=ToolParamType.STRING,
+                description="配置时区下的未来 YYYY-MM-DD HH:MM[:SS]；与 delay_minutes 二选一",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="delay_minutes", param_type=ToolParamType.NUMBER,
+                description="从现在延后多少分钟，须大于 0；与 run_at 二选一",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="request_id", param_type=ToolParamType.STRING,
+                description="可选，仅任务 add：同一请求重试沿用此键，避免重复安排",
                 required=False,
             ),
         ],
@@ -242,16 +304,25 @@ class MaiLifePlugin(MaiBotPlugin):
         action: str = "update",
         request: str = "",
         date: str = "",
+        task_id: str = "",
+        title: str = "",
+        intent: str = "",
+        run_at: str = "",
+        delay_minutes: float | None = None,
+        request_id: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
         try:
+            unsupported = {"repeat", "recurrence", "cron", "interval", "frequency", "every", "repeat_interval", "target_stream_id", "timezone"}.intersection(kwargs)
+            if unsupported:
+                return {"success": False, "content": "不支持周期、跨流或每任务时区参数，请使用当前流单次任务"}
             return await self._modify_life(
-                target=target,
-                action=action,
-                request=request,
-                date=date,
-                kwargs=kwargs,
+                target=target, action=action, request=request, date=date, kwargs=kwargs,
+                task_id=task_id, title=title, intent=intent, run_at=run_at,
+                delay_minutes=delay_minutes, request_id=request_id,
             )
+        except ValueError as exc:
+            return {"success": False, "content": f"参数无效：{exc}"}
         except Exception as exc:
             logger.exception("修改生活记录失败")
             return {"success": False, "content": f"修改失败：{exc}"}
@@ -281,7 +352,7 @@ class MaiLifePlugin(MaiBotPlugin):
         document = self._load_today(now)
         activity_count = len(document.activities) if document else 0
         share_count = len(document.shares) if document else 0
-        pending = sum(1 for item in document.shares if not item.fired) if document else 0
+        pending = sum(1 for item in document.shares if task_state(item) == "pending") if document else 0
         stream_count = len({item.stream_id for item in document.shares if item.stream_id}) if document else 0
         text = (
             f"插件启用：{'是' if self.config.plugin.enabled else '否'}\n"
@@ -307,7 +378,9 @@ class MaiLifePlugin(MaiBotPlugin):
         if not self.config.plugin.enabled:
             await self._reply(stream_id, "麦麦生活未启用")
             return True, "插件未启用", 2
-        asyncio.create_task(self._generate_and_notify(stream_id), name="mai-life-manual-generate")
+        task = asyncio.create_task(self._generate_and_notify(stream_id), name="mai-life-manual-generate")
+        self._manual_generation_tasks.add(task)
+        task.add_done_callback(self._manual_generation_tasks.discard)
         await self._reply(stream_id, "正在生成今日日程和分享任务…")
         return True, "已开始生成", 2
 
@@ -358,19 +431,26 @@ class MaiLifePlugin(MaiBotPlugin):
             return {"success": True, "content": "麦麦生活未启用"}
         session_id = self._tool_session_id(kwargs)
         now = self._now()
-        query_date = normalize_text(date) or now.strftime("%Y-%m-%d")
+        requested_date = normalize_text(date)
+        query_date = requested_date or now.strftime("%Y-%m-%d")
+        parse_date(query_date)
         scope = normalize_text(target).lower() or "both"
         if scope not in {"schedule", "share", "both"}:
             return {"success": False, "content": "target 只能是 schedule、share 或 both"}
 
-        streams = await self._cached_streams(self.config.schedule.stream_discovery_platform)
         want_schedule = scope in {"schedule", "both"}
         want_share = scope in {"share", "both"}
-        if want_schedule and not session_allowed(session_id, self.config.schedule.allowed_streams, streams):
-            want_schedule = False
-        share_streams = await self._cached_streams("all_platforms")
-        if want_share and not session_allowed(session_id, share_allowlist(self.config.share), share_streams):
-            want_share = False
+        if want_schedule:
+            streams = await self._cached_streams(self.config.schedule.stream_discovery_platform)
+            if not session_allowed(session_id, self.config.schedule.allowed_streams, streams):
+                want_schedule = False
+        if want_share:
+            share_streams = await self._cached_streams("all_platforms")
+            if (
+                not session_allowed(session_id, share_allowlist(self.config.share), share_streams)
+                or not any(stream_session_id(stream) == session_id for stream in share_streams)
+            ):
+                want_share = False
         if scope == "schedule" and not want_schedule:
             return {"success": True, "content": "当前聊天流未启用日程功能"}
         if scope == "share" and not want_share:
@@ -378,84 +458,82 @@ class MaiLifePlugin(MaiBotPlugin):
         if not want_schedule and not want_share:
             return {"success": True, "content": "当前聊天流未启用麦麦生活"}
 
-        document = None if self._store is None else self._store.load(query_date)
-        if document is None:
-            return {"success": True, "content": f"{query_date} 还没有生活记录"}
+        if self._store is None:
+            return {"success": False, "content": "存储未初始化"}
         parts: list[str] = []
         if want_schedule:
             if not self.config.schedule.enabled:
                 parts.append("日程功能未启用")
             else:
-                parts.append(f"{query_date} 日程：\n{format_activities(document.activities)}")
+                document = self._store.load(query_date)
+                if query_date == now.strftime("%Y-%m-%d"):
+                    text = build_today_schedule_text(document, self._load_yesterday(now), now)
+                else:
+                    text = format_activities(document.activities) if document else "（该日期暂无日程）"
+                parts.append(f"{query_date} 日程：\n{text}")
+        records: list[dict[str, Any]] = []
         if want_share:
             if not self.config.share.enabled:
-                parts.append("分享功能未启用")
+                parts.append("分享/定时任务功能未启用")
             else:
-                current_shares = shares_for_stream(document, session_id) if session_id else document.shares
-                parts.append(f"{query_date} 当前聊天流分享任务：\n{format_shares(current_shares)}")
-        return {"success": True, "content": "\n\n".join(parts)}
+                records = TaskManager(self._store).list(session_id, self.config.generation.timezone, requested_date)
+                label = f"{requested_date} 到期" if requested_date else "跨日期待处理"
+                parts.append(f"当前聊天流{label}任务：\n{format_task_records(records)}")
+        return {
+            "success": True, "content": "\n\n".join(parts), "tasks": records,
+            "timezone": self.config.generation.timezone,
+        }
 
     async def _modify_life(
-        self,
-        target: str,
-        action: str,
-        request: str,
-        date: str,
-        kwargs: dict[str, Any],
+        self, target: str, action: str, request: str, date: str, kwargs: dict[str, Any], *,
+        task_id: str = "", title: str = "", intent: str = "", run_at: str = "",
+        delay_minutes: float | None = None, request_id: str = "",
     ) -> dict[str, Any]:
         if not self.config.plugin.enabled:
             return {"success": False, "content": "麦麦生活未启用"}
-        if self._generator is None:
-            return {"success": False, "content": "生成器未初始化"}
+        if self._store is None:
+            return {"success": False, "content": "存储未初始化"}
         session_id = self._tool_session_id(kwargs)
         now = self._now()
         target_name = normalize_text(target).lower() or "schedule"
         action_name = normalize_text(action).lower() or "update"
-        request_text = normalize_text(request)
         if target_name not in {"schedule", "share"}:
             return {"success": False, "content": "target 只能是 schedule 或 share"}
-        if action_name not in {"add", "update", "delete", "replace_day"}:
-            return {"success": False, "content": "action 只能是 add、update、delete 或 replace_day"}
-        if not request_text:
-            return {"success": False, "content": "request 不能为空"}
-
-        if target_name == "schedule":
-            streams = await self._cached_streams(self.config.schedule.stream_discovery_platform)
-            if not self.config.schedule.enabled or not session_allowed(
-                session_id, self.config.schedule.allowed_streams, streams
-            ):
-                return {"success": False, "content": "当前聊天流未启用日程功能"}
-        else:
+        if target_name == "share":
             streams = await self._cached_streams("all_platforms")
             if not self.config.share.enabled or not session_allowed(
                 session_id, share_allowlist(self.config.share), streams
             ):
-                return {"success": False, "content": "当前聊天流未启用分享提醒"}
-
-        stream_info = ""
-        if session_id:
-            for stream in streams:
-                if stream_session_id(stream) == session_id:
-                    stream_info = format_stream_info(stream)
-                    break
+                return {"success": False, "content": "当前聊天流未启用分享/定时任务"}
+            if not any(stream_session_id(stream) == session_id for stream in streams):
+                return {"success": False, "content": "当前流尚未在 Host 注册，不能自行构造目标聊天流"}
+            return TaskManager(self._store).manage(
+                action=action_name, stream_id=session_id, now=now,
+                timezone=self.config.generation.timezone, date=date, task_id=task_id,
+                title=title, intent=intent, run_at=run_at, delay_minutes=delay_minutes,
+                request_id=request_id, request=request, wake_planner=self.config.share.wake_planner,
+            )
+        if action_name not in {"add", "update", "delete", "replace_day"}:
+            return {"success": False, "content": "schedule 只支持 add/update/delete/replace_day"}
+        if task_id or title or intent or run_at or delay_minutes is not None or request_id:
+            return {"success": False, "content": "日程修改请使用 request；任务结构化字段只用于 target=share"}
+        request_text = normalize_text(request)
+        if not request_text:
+            return {"success": False, "content": "日程修改 request 不能为空"}
+        schedule_date = normalize_text(date) or now.strftime("%Y-%m-%d")
+        parse_date(schedule_date)
+        streams = await self._cached_streams(self.config.schedule.stream_discovery_platform)
+        if not self.config.schedule.enabled or not session_allowed(
+            session_id, self.config.schedule.allowed_streams, streams
+        ):
+            return {"success": False, "content": "当前聊天流未启用日程功能"}
+        if self._generator is None:
+            return {"success": False, "content": "生成器未初始化"}
         document = await self._generator.modify(
-            self.config,
-            now,
-            date=normalize_text(date) or now.strftime("%Y-%m-%d"),
-            target=target_name,
-            action=action_name,
-            request=request_text,
-            persona=self._cached_persona,
-            bot_nickname=self._cached_nickname,
-            stream_id=session_id if target_name == "share" else "",
-            stream_info=stream_info,
+            self.config, now, date=schedule_date, target="schedule", action=action_name,
+            request=request_text, persona=self._cached_persona, bot_nickname=self._cached_nickname,
         )
-        if target_name == "share":
-            current_shares = shares_for_stream(document, session_id) if session_id else document.shares
-            content = f"已更新当前聊天流分享任务：\n{format_shares(current_shares)}"
-        else:
-            content = f"已更新日程：\n{format_activities(document.activities)}"
-        return {"success": True, "content": content}
+        return {"success": True, "content": f"已更新日程：\n{format_activities(document.activities)}"}
 
     async def _generate_today(self, force: bool) -> LifeDocument | None:
         if self._generator is None:
@@ -499,10 +577,13 @@ class MaiLifePlugin(MaiBotPlugin):
             return
         current_shares = shares_for_stream(document, stream_id) if stream_id else document.shares
         stream_count = len({item.stream_id for item in document.shares if item.stream_id})
+        warning = ""
+        if any(item.source == "legacy" for item in document.shares):
+            warning = "\n含来源未知的旧任务：相应聊天流的自动分享重生成已跳过，原任务完整保留。可逐项接管，次日新记录不受影响。"
         await self._reply(
             stream_id,
             f"已生成 {document.date}：日程 {len(document.activities)} 条，"
-            f"当前聊天流分享 {len(current_shares)} 条，共 {stream_count} 个聊天流。",
+            f"当前聊天流统一任务 {len(current_shares)} 条，共 {stream_count} 个聊天流。{warning}",
         )
 
     def _load_today(self, now: datetime) -> LifeDocument | None:
@@ -510,60 +591,88 @@ class MaiLifePlugin(MaiBotPlugin):
             return None
         return self._store.load(now.strftime("%Y-%m-%d"))
 
-    def _mark_share_fired(self, date: str, share_id: str, now: datetime) -> None:
+    def _load_yesterday(self, now: datetime) -> LifeDocument | None:
         if self._store is None:
-            return
-        self._store.mark_share_fired(date, share_id, now)
+            return None
+        return self._store.load((now - timedelta(days=1)).strftime("%Y-%m-%d"))
+
+    def _mark_share_fired(self, date: str, share_id: str, now: datetime) -> None:
+        if self._store is not None:
+            self._store.mark_share_fired(date, share_id, now)
 
     async def _fire_share(self, item: ShareItem, document: LifeDocument, now: datetime) -> None:
-        target_stream_id = normalize_text(item.stream_id)
-        if target_stream_id:
-            streams = [stream for stream in await self._list_share_streams() if stream_session_id(stream) == target_stream_id]
-        else:
-            streams = await self._list_share_streams()
-        if not streams:
-            logger.info("分享任务到期但没有匹配的聊天流: %s stream=%s", item.id, target_stream_id)
-            self._mark_share_fired(document.date, item.id, now)
+        if self._store is None or not self.config.plugin.enabled or not self.config.share.enabled or not self.config.share.wake_planner:
             return
-        share_item = f"{item.time} {item.title}"
-        if item.hint:
-            share_item += f"（{item.hint}）"
-        intent = item.intent.strip() or render_template(
-            choose_template(self.config.prompts.wake_intent_template, DEFAULT_WAKE_INTENT_TEMPLATE),
-            self._wake_values(now, share_item=share_item),
-        )
-        cooldown = self.config.share.cooldown_seconds
-        triggered = False
-        for stream in streams:
-            stream_id = stream_session_id(stream)
-            if not stream_id:
-                continue
-            if self._scheduler is not None and not self._scheduler.can_wake_stream(stream_id, now, cooldown):
-                logger.info("聊天流仍在冷却，跳过唤醒: %s", stream_id)
-                continue
+        # 未绑定的旧记录不广播到所有白名单流，也不猜测它的原目标。
+        target_stream_id = normalize_text(item.stream_id)
+        if not target_stream_id:
+            self._store.mark_task_state(document.date, "", item.id, "skipped", "legacy_stream_unknown", now, expected=item)
+            return
+        streams = [
+            stream for stream in await self._list_share_streams()
+            if stream_session_id(stream) == target_stream_id
+        ]
+        if not streams:
+            # Host 流暂不可发现或不在白名单时保持 pending，宽限后由巡检记录跳过。
+            logger.info("任务到期但当前未匹配白名单真实聊天流: task=%s", item.id)
+            return
+        if not self.config.plugin.enabled or not self.config.share.enabled or not self.config.share.wake_planner:
+            return
+        now = self._now()
+        status = share_due_status(item, now, owner_date=document.date, miss_tolerance_minutes=DEFAULT_MISS_TOLERANCE_MINUTES)
+        if status == "missed":
+            self._store.mark_task_state(document.date, target_stream_id, item.id, "skipped", "missed_tolerance", now, expected=item)
+            return
+        if status != "due":
+            return
+        if self._scheduler is not None and not self._scheduler.can_wake_stream(target_stream_id, now, self.config.share.cooldown_seconds):
+            return
+        claimed = self._store.claim_task(document.date, item)
+        if claimed is None:
+            return
+        intent = claimed.intent.strip()
+        if not intent and claimed.source == "planner":
+            self._store.mark_task_state(document.date, target_stream_id, item.id, "skipped", "missing_planner_intent", now, expected_state="submitting")
+            return
+        if not intent:
+            share_item = f"{claimed.time} {claimed.title}"
+            if claimed.hint:
+                share_item += f"（{claimed.hint}）"
+            intent = render_template(
+                choose_template(self.config.prompts.wake_intent_template, DEFAULT_WAKE_INTENT_TEMPLATE),
+                self._wake_values(now, share_item=share_item),
+            )
+        try:
             result = await self.ctx.maisaka.proactive.trigger(
-                stream_id=stream_id,
-                intent=intent,
-                reason="mai_life_share",
+                stream_id=target_stream_id, intent=intent,
+                reason="mai_life_task" if claimed.source == "planner" else "mai_life_share",
                 metadata={
-                    "source": "mai-life",
-                    "share_id": item.id,
-                    "date": document.date,
+                    "source": "mai-life", "task_id": claimed.id, "share_id": claimed.id,
+                    "owner_date": document.date, "date": document.date,
+                    "task_source": claimed.source, "run_at": task_due_at(claimed, document.date).isoformat(timespec="seconds"),
                 },
             )
-            success = True
-            if isinstance(result, dict) and result.get("success") is False:
-                success = False
-                logger.warning("唤醒规划器返回失败: stream=%s result=%s", stream_id, result)
-            if success:
-                triggered = True
-                if self._scheduler is not None:
-                    self._scheduler.remember_wake(stream_id, now)
-        if triggered:
-            self._mark_share_fired(document.date, item.id, now)
-            logger.info("已唤醒规划器分享任务: %s %s", item.time, item.title)
+        except (Exception, asyncio.CancelledError):
+            # RPC 断开/超时可能发生在 Host 已接受之后，不冒充失败并自动重复提交。
+            finished_at = self._now()
+            if self._scheduler is not None:
+                self._scheduler.remember_wake(target_stream_id, finished_at)
+            self._store.mark_task_state(document.date, target_stream_id, item.id, "consumed", "submission_result_unknown", finished_at, expected_state="submitting")
+            raise
+        finished_at = self._now()
+        if isinstance(result, dict) and result.get("success") is True:
+            if self._scheduler is not None:
+                self._scheduler.remember_wake(target_stream_id, finished_at)
+            self._store.mark_task_state(document.date, target_stream_id, item.id, "submitted", "host_accepted", finished_at, expected_state="submitting")
+            logger.info("任务已提交规划器（不等于消息已发出）: task=%s", item.id)
+        elif isinstance(result, dict) and result.get("success") is False:
+            self._store.mark_task_state(document.date, target_stream_id, item.id, "pending", "host_rejected", finished_at, expected_state="submitting")
+            logger.warning("Host 未接受任务，保留宽限内重试: task=%s", item.id)
         else:
-            logger.warning("分享任务未能唤醒任何聊天流: %s", item.id)
+            if self._scheduler is not None:
+                self._scheduler.remember_wake(target_stream_id, finished_at)
+            self._store.mark_task_state(document.date, target_stream_id, item.id, "consumed", "submission_result_unknown", finished_at, expected_state="submitting")
+            logger.warning("Host 返回形状未知，未宣称提交成功: task=%s", item.id)
 
     def _wake_values(self, now: datetime, share_item: str) -> dict[str, str]:
         return {
@@ -582,22 +691,25 @@ class MaiLifePlugin(MaiBotPlugin):
         return filter_streams(streams, share_allowlist(self.config.share))
 
     async def _cached_streams(self, platform: str) -> list[dict[str, Any]]:
+        platform = platform or "all_platforms"
         now = datetime.now()
-        if self._stream_cache_at is not None and (now - self._stream_cache_at).total_seconds() < 60:
-            return self._stream_cache
+        cached = self._stream_cache.get(platform)
+        if cached is not None and 0 <= (now - cached[0]).total_seconds() < 60:
+            return cached[1]
+        fallback = cached[1] if cached is not None else []
         try:
-            streams = await self.ctx.chat.get_all_streams(platform or "all_platforms")
+            streams = await self.ctx.chat.get_all_streams(platform)
         except Exception:
             logger.exception("读取聊天流列表失败")
-            return self._stream_cache
+            return fallback
         if isinstance(streams, dict) and streams.get("success") is False:
             logger.warning("读取聊天流列表失败: %s", streams.get("error"))
-            return self._stream_cache
+            return fallback
         if not isinstance(streams, list):
-            return self._stream_cache
-        self._stream_cache = [item for item in streams if isinstance(item, dict)]
-        self._stream_cache_at = now
-        return self._stream_cache
+            return fallback
+        result = [item for item in streams if isinstance(item, dict)]
+        self._stream_cache[platform] = (now, result)
+        return result
 
     async def _resolve_history_by_streams(self, streams: list[dict[str, Any]]) -> dict[str, str]:
         result: dict[str, str] = {}
@@ -714,7 +826,6 @@ class MaiLifePlugin(MaiBotPlugin):
         return (
             normalize_text(kwargs.get("stream_id"))
             or normalize_text(kwargs.get("chat_id"))
-            or normalize_text(kwargs.get("session_id"))
         )
 
     async def _require_command_admin(

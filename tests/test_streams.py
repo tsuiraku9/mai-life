@@ -29,26 +29,20 @@ def test_all_allowlist() -> None:
 
 
 def test_webui_photo_studio_style_allowlist() -> None:
+    session_id = "synthetic-webui-session"
+    user_id = "webui_user_synthetic_fixture"
     streams = [
         {
-            "session_id": "b590adaffdce61e34e93f0e5f15c0468",
+            "session_id": session_id,
             "platform": "webui",
-            "user_id": "webui_user_webui_9wlzqinly_mspamwsn",
+            "user_id": user_id,
             "chat_type": "private",
         }
     ]
-    assert session_allowed(
-        "b590adaffdce61e34e93f0e5f15c0468",
-        ["webui:webui_user_webui_9wlzqinly_mspamwsn"],
-        streams,
-    )
-    assert session_allowed(
-        "b590adaffdce61e34e93f0e5f15c0468",
-        ["webui:private:webui_user_webui_9wlzqinly_mspamwsn"],
-        streams,
-    )
-    matched = filter_streams(streams, ["webui:webui_user_webui_9wlzqinly_mspamwsn"])
-    assert [item["session_id"] for item in matched] == ["b590adaffdce61e34e93f0e5f15c0468"]
+    assert session_allowed(session_id, [f"webui:{user_id}"], streams)
+    assert session_allowed(session_id, [f"webui:private:{user_id}"], streams)
+    matched = filter_streams(streams, [f"webui:{user_id}"])
+    assert [item["session_id"] for item in matched] == [session_id]
 
 
 def test_session_and_group_allowlist() -> None:

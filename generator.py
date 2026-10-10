@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import deepcopy
 from datetime import datetime, timedelta
 from typing import Any
 import json
@@ -26,12 +27,15 @@ from .store import (
     LifeStore,
     ShareItem,
     activity_from_dict,
-    replace_stream_shares,
+    new_task_id,
     share_from_dict,
     shares_for_stream,
+    stream_generation_done,
+    task_signature,
+    task_state,
 )
 from .streams import format_stream_info, normalize_text, stream_session_id
-from .times import is_cross_day, is_in_time_window, is_valid_hhmm, weekday_cn
+from .times import combine_on_date, is_cross_day, is_in_time_window, is_valid_hhmm, parse_date, weekday_cn
 
 logger = logging.getLogger("mailife.mai-life")
 
@@ -134,14 +138,17 @@ def format_activities(activities: list[Activity]) -> str:
 
 
 def format_shares(shares: list[ShareItem]) -> str:
-    """把分享任务格式化成可读文本。"""
+    """管理员兼容展示；触发成功仅表示已提交，不称作已经发言。"""
 
+    labels = {
+        "pending": "待处理", "submitting": "正在提交", "submitted": "已提交规划器",
+        "skipped": "已跳过", "cancelled": "已取消", "consumed": "已消费，结果未知",
+    }
     if not shares:
         return "（无）"
     lines = []
     for item in shares:
-        status = "已提醒" if item.fired else "未提醒"
-        line = f"- {item.time} {item.title} [{status}]"
+        line = f"- {item.due_at or item.time} {item.title} [{labels[task_state(item)]}] task_id={item.id}"
         if item.hint:
             line += f" | {item.hint}"
         lines.append(line)
@@ -310,10 +317,12 @@ class LifeGenerator:
         else:
             values["recent_days_schedule"] = "（未附带近几日日程）"
 
-        document = existing or LifeDocument(
+        document = deepcopy(existing) if existing else LifeDocument(
             date=date,
             generated_at=now.strftime("%Y-%m-%dT%H:%M:%S"),
         )
+        original_activities = deepcopy(document.activities)
+        generated_activities: list[Activity] | None = None
         need_schedule = config.schedule.enabled and (force or not document.activities)
         if need_schedule:
             activities = await self._generate_activities(config, values)
@@ -322,28 +331,67 @@ class LifeGenerator:
                 if existing is None:
                     return None
             else:
+                generated_activities = activities
                 document.activities = activities
-                document.generated_at = now.strftime("%Y-%m-%dT%H:%M:%S")
         values["schedule_json"] = json.dumps(
             {"activities": [item.to_dict() for item in document.activities]},
             ensure_ascii=False,
             indent=2,
         )
 
+        generated_by_stream: dict[str, list[ShareItem]] = {}
         if config.share.enabled:
-            await self._generate_shares_for_streams(
-                config,
-                values,
-                document,
-                share_streams or [],
-                history_by_stream or {},
-                force=force,
+            generated_by_stream = await self._generate_shares_for_streams(
+                config, values, document, share_streams or [], history_by_stream or {}, force=force,
             )
+        if generated_activities is None and not generated_by_stream:
+            return self.store.load(date)
 
-        if not document.activities and not document.shares:
-            return existing
-        self.store.save(document)
-        return document
+        def merge(latest: LifeDocument) -> None:
+            # 模型在锁外运行；只有本次生成的部分能写回，不能覆盖新任务或巡检终态。
+            if generated_activities is not None:
+                if latest.activities == original_activities:
+                    latest.activities = generated_activities
+                    latest.generated_at = now.isoformat(timespec="seconds")
+                else:
+                    logger.warning("生成期间日程已被修改，保留最新日程 date=%s", date)
+            for stream_id, fresh in generated_by_stream.items():
+                current = shares_for_stream(latest, stream_id)
+                if any(item.source == "legacy" for item in latest.shares if item.stream_id in {"", stream_id}):
+                    logger.warning("旧任务来源不明，保护该流并跳过自动分享重生成 date=%s stream=%s", date, stream_id)
+                    continue
+                if not force and stream_generation_done(latest, stream_id):
+                    continue
+                kept = [
+                    item for item in latest.shares
+                    if not (item.stream_id == stream_id and item.source == "generated" and task_state(item) == "pending")
+                ]
+                # 已接管、提交中或终态的同意图同时间不再补进；取消不能被重生成复活。
+                protected = [(date, item) for item in kept if item.stream_id == stream_id]
+                protected.extend(
+                    (owner, item) for owner, item in self.store.list_tasks(stream_id=stream_id)
+                    if owner != date
+                )
+                signatures = set()
+                for owner, item in protected:
+                    try:
+                        signatures.add(task_signature(item, owner))
+                        if item.generation_key:
+                            signatures.add(item.generation_key)
+                    except ValueError:
+                        continue
+                additions = []
+                for item in fresh:
+                    signature = task_signature(item, date)
+                    if signature not in signatures:
+                        additions.append(item)
+                        signatures.add(signature)
+                latest.shares = kept + additions
+                if stream_id not in latest.generated_streams:
+                    latest.generated_streams.append(stream_id)
+
+        saved, _ = self.store.mutate(date, merge, generated_at=now.isoformat(timespec="seconds"))
+        return saved
 
     async def modify(
         self,
@@ -359,9 +407,12 @@ class LifeGenerator:
         stream_id: str = "",
         stream_info: str = "",
     ) -> LifeDocument:
-        """按自然语言或 JSON 修改指定日期的日程或分享任务。"""
+        """只对日程调用模型，定时任务必须使用 TaskManager 的逐项接口。"""
 
+        if target != "schedule":
+            raise ValueError("定时任务不支持模型重写，请使用结构化任务接口")
         date = date.strip() or now.strftime("%Y-%m-%d")
+        parse_date(date)
         document = self.store.load(date) or LifeDocument(
             date=date,
             generated_at=now.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -383,18 +434,8 @@ class LifeGenerator:
                     ensure_ascii=False,
                     indent=2,
                 ),
-                "share_json": json.dumps(
-                    {
-                        "shares": [
-                            item.to_dict()
-                            for item in (
-                                shares_for_stream(document, stream_id) if stream_id else document.shares
-                            )
-                        ]
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
+                # 兼容自定义模板占位符，但日程模型不得接收任何聊天流的定时意图。
+                "share_json": "{}",
                 "stream_id": stream_id,
                 "stream_info": stream_info or stream_id or "（无）",
             }
@@ -408,22 +449,22 @@ class LifeGenerator:
         if data is None:
             raise RuntimeError("修改失败：模型没有返回合法 JSON")
 
-        if target == "share":
-            shares = parse_shares(data)
-            if not shares and action != "delete":
-                raise RuntimeError("修改失败：没有解析到合法的分享任务")
-            stream_id = normalize_text(values.get("stream_id"))
-            if stream_id:
-                replace_stream_shares(document, stream_id, shares)
-            else:
-                document.shares = shares
-        else:
-            activities = parse_activities(data)
-            if not activities and action != "delete":
-                raise RuntimeError("修改失败：没有解析到合法的日程活动")
-            document.activities = activities
-        self.store.save(document)
-        return document
+        raw_activities = data.get("activities")
+        if not isinstance(raw_activities, list):
+            raise RuntimeError("修改失败：activities 必须是显式的完整列表，原日程未修改")
+        activities = parse_activities(data)
+        if len(activities) != len(raw_activities):
+            raise RuntimeError("修改失败：activities 含非法活动，原日程未修改")
+        if not activities and action != "delete":
+            raise RuntimeError("修改失败：没有解析到合法的日程活动")
+
+        def update_schedule(latest: LifeDocument) -> None:
+            if latest.activities != document.activities:
+                raise RuntimeError("模型处理期间日程已更新，请重新查询后再修改")
+            latest.activities = activities
+
+        saved, _ = self.store.mutate(date, update_schedule, generated_at=document.generated_at)
+        return saved
 
     def _base_values(
         self,
@@ -489,15 +530,19 @@ class LifeGenerator:
         history_by_stream: dict[str, str],
         *,
         force: bool,
-    ) -> None:
+    ) -> dict[str, list[ShareItem]]:
+        generated: dict[str, list[ShareItem]] = {}
         if not share_streams:
             logger.info("分享白名单没有匹配到聊天流，跳过分享生成")
-            return
+            return generated
         for stream in share_streams:
             session_id = stream_session_id(stream)
-            if not session_id:
+            if not session_id or session_id in generated:
                 continue
-            if not force and shares_for_stream(document, session_id):
+            if any(item.source == "legacy" for item in document.shares if item.stream_id in {"", session_id}):
+                logger.warning("旧任务来源不明，保护该流并跳过自动分享重生成 date=%s stream=%s", document.date, session_id)
+                continue
+            if not force and stream_generation_done(document, session_id):
                 continue
             count_min, count_max, extra_prompt = resolve_share_profile(config.share, stream)
             stream_values = dict(values)
@@ -517,29 +562,36 @@ class LifeGenerator:
                 }
             )
             shares = await self._generate_shares(config, stream_values)
-            if not shares:
-                logger.error("聊天流分享任务生成失败: session=%s", session_id)
+            if shares is None:
+                logger.error("聊天流分享任务生成失败，未标记生成完成: session=%s", session_id)
                 continue
-            for item in shares:
-                item.stream_id = session_id
-            replace_stream_shares(document, session_id, shares)
-            logger.info("已生成聊天流分享任务: session=%s count=%s", session_id, len(shares))
+            # ID、来源和状态由可信代码生成，不能接受模型伪造的 fired/stream/source。
+            fresh = [
+                ShareItem(
+                    id=new_task_id(), time=item.time, title=item.title, hint=item.hint,
+                    intent=item.intent, stream_id=session_id, source="generated",
+                    due_at=combine_on_date(parse_date(document.date), item.time).isoformat(timespec="seconds"),
+                )
+                for item in shares
+            ]
+            for item in fresh:
+                item.generation_key = task_signature(item, document.date)
+            generated[session_id] = fresh
+            logger.info("已生成聊天流分享任务: session=%s count=%s", session_id, len(fresh))
+        return generated
 
-    async def _generate_shares(self, config: MaiLifeConfig, values: dict[str, str]) -> list[ShareItem]:
+    async def _generate_shares(self, config: MaiLifeConfig, values: dict[str, str]) -> list[ShareItem] | None:
         system_prompt = choose_template(config.prompts.share_system, DEFAULT_SHARE_SYSTEM)
         user_prompt = render_template(
-            choose_template(config.prompts.share_user, DEFAULT_SHARE_USER),
-            values,
+            choose_template(config.prompts.share_user, DEFAULT_SHARE_USER), values,
         )
         data = await self._ask_json(config, system_prompt, user_prompt, retries=1)
-        if data is None:
-            return []
+        if data is None or not isinstance(data.get("shares"), list):
+            return None
         shares = parse_shares(data)
-        kept = drop_shares_in_silence(
-            shares,
-            config.share.silence_start,
-            config.share.silence_end,
-        )
+        if len(shares) != len(data["shares"]):
+            return None
+        kept = drop_shares_in_silence(shares, config.share.silence_start, config.share.silence_end)
         if shares and not kept:
             logger.warning("分享任务全部落在静默时段内，已全部丢弃")
         elif len(kept) < len(shares):

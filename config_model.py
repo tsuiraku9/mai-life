@@ -17,13 +17,14 @@ from .prompts import (
     DEFAULT_SHARE_USER,
     DEFAULT_WAKE_INTENT_TEMPLATE,
 )
+from .tool_descriptions import DEFAULT_MODIFY_TOOL_DESCRIPTION, DEFAULT_QUERY_TOOL_DESCRIPTION
 
 
-def _ui(label: str, *, textarea: bool = False, placeholder: str = "", hint: str = "") -> dict[str, Any]:
+def _ui(label: str, *, textarea: bool = False, rows: int = 6, placeholder: str = "", hint: str = "") -> dict[str, Any]:
     extra: dict[str, Any] = {"label": label}
     if textarea:
         extra["x-widget"] = "textarea"
-        extra["rows"] = 6
+        extra["rows"] = rows
     if placeholder:
         extra["placeholder"] = placeholder
     if hint:
@@ -44,7 +45,7 @@ class PluginSection(PluginConfigBase):
         json_schema_extra=_ui("启用插件"),
     )
     config_version: str = Field(
-        default="1.2.0",
+        default="1.3.0",
         description="配置结构版本，一般不用改",
         json_schema_extra=_ui("配置版本"),
     )
@@ -237,7 +238,7 @@ class ShareStreamProfile(PluginConfigBase):
 
 
 class ShareSection(PluginConfigBase):
-    """按聊天流隔离的分享任务生成与到点唤醒。"""
+    """按聊天流隔离的自动分享与单次定时意图，到期提交规划器唤醒。"""
 
     __ui_label__ = "分享提醒"
     __ui_icon__ = "bell"
@@ -245,12 +246,12 @@ class ShareSection(PluginConfigBase):
 
     enabled: bool = Field(
         default=True,
-        description="关闭后不再为各聊天流生成分享任务，也不再到点唤醒",
+        description="关闭后不再生成自动分享，也不再接受单次任务操作或到期唤醒。当前流仍须在分享白名单中启用",
         json_schema_extra=_ui("启用分享提醒"),
     )
     stream_profiles: list[ShareStreamProfile] = Field(
         default_factory=list,
-        description="填写聊天流即启用该聊天流的分享生成和到点唤醒，每个聊天流单独生成一份。条数、额外提示词按该聊天流自己的配置生效。支持 all、session:<id>、<platform>:private:<id>、<platform>:<user_id>",
+        description="填写聊天流即启用该流的自动分享、单次任务管理和到期唤醒；自动分享按流单独生成，条数、额外提示词仅作用于该流的自动生成。支持 all、session:<id>、<platform>:private:<id>、<platform>:<user_id>",
         json_schema_extra=_ui("启用的聊天流"),
     )
 
@@ -301,12 +302,12 @@ class ShareSection(PluginConfigBase):
 
     wake_planner: bool = Field(
         default=True,
-        description="到点后是否唤醒对应聊天流的规划器",
+        description="到期后是否向 Host 提交当前任务所属流的规划器唤醒请求。关闭时仍可保存任务，但结果会提示不会自动唤醒；提交成功不等于消息已发出",
         json_schema_extra=_ui("到点唤醒规划器"),
     )
     patrol_interval_seconds: int = Field(
         default=60,
-        description="检查分享任务是否到期的间隔",
+        description="检查自动分享和单次任务是否到期的间隔；实际提交受巡检与冷却影响，不保证秒级准点",
         json_schema_extra=_ui("巡检间隔（秒）"),
     )
     cooldown_seconds: int = Field(
@@ -316,13 +317,42 @@ class ShareSection(PluginConfigBase):
     )
     silence_start: str = Field(
         default="00:00",
-        description="静默开始时间。生成分享任务时不会把提醒安排在这个时段内，已有提醒仍会到点发出",
+        description="自动生活分享的静默开始时间。生成时避开该时段；自主创建的单次意图不受静默限制，实际到期提交仍受巡检和冷却影响",
         json_schema_extra=_ui("静默开始", placeholder="00:00"),
     )
     silence_end: str = Field(
         default="07:30",
-        description="静默结束时间。开始与结束相同表示不设静默时段",
+        description="自动生活分享的静默结束时间。开始与结束相同表示不设静默时段；自主创建的单次意图不受该时段限制",
         json_schema_extra=_ui("静默结束", placeholder="07:30"),
+    )
+
+
+class ToolSection(PluginConfigBase):
+    """规划器工具描述，直接展示可编辑的默认文案。"""
+
+    __ui_label__ = "规划器工具"
+    __ui_icon__ = "wrench"
+    __ui_order__ = 4
+
+    query_description: str = Field(
+        default=DEFAULT_QUERY_TOOL_DESCRIPTION,
+        description="mai_life_query 的工具描述，可直接修改；空白恢复默认。修改后需重载插件。",
+        json_schema_extra=_ui(
+            "查询工具描述",
+            textarea=True,
+            rows=2,
+            hint="保存后请手动重载插件或重启 MaiBot。",
+        ),
+    )
+    modify_description: str = Field(
+        default=DEFAULT_MODIFY_TOOL_DESCRIPTION,
+        description="mai_life_modify 的工具描述，可直接修改；空白恢复默认。修改后需重载插件。",
+        json_schema_extra=_ui(
+            "日程与定时任务工具描述",
+            textarea=True,
+            rows=4,
+            hint="保存后请手动重载插件或重启 MaiBot。",
+        ),
     )
 
 
@@ -331,7 +361,7 @@ class PromptSection(PluginConfigBase):
 
     __ui_label__ = "提示词"
     __ui_icon__ = "file-text"
-    __ui_order__ = 4
+    __ui_order__ = 5
 
     schedule_system: str = Field(
         default=DEFAULT_SCHEDULE_SYSTEM,
@@ -355,12 +385,12 @@ class PromptSection(PluginConfigBase):
     )
     modify_system: str = Field(
         default=DEFAULT_MODIFY_SYSTEM,
-        description="修改日程或分享任务时的系统提示词",
+        description="自然语言修改生活日程时的系统提示词；结构化单次任务管理不调用该提示词",
         json_schema_extra=_ui("修改系统提示词", textarea=True),
     )
     modify_user: str = Field(
         default=DEFAULT_MODIFY_USER,
-        description="修改日程或分享任务时的用户提示词",
+        description="自然语言修改生活日程时的用户提示词；结构化单次任务管理不调用该提示词",
         json_schema_extra=_ui("修改用户提示词", textarea=True),
     )
     inject_template: str = Field(
@@ -382,6 +412,7 @@ class MaiLifeConfig(PluginConfigBase):
     generation: GenerationSection = Field(default_factory=GenerationSection)
     schedule: ScheduleSection = Field(default_factory=ScheduleSection)
     share: ShareSection = Field(default_factory=ShareSection)
+    tools: ToolSection = Field(default_factory=ToolSection)
     prompts: PromptSection = Field(default_factory=PromptSection)
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
@@ -21,6 +22,52 @@ def format_activity_line(activity: Activity, *, cross_day: bool = False) -> str:
     return line
 
 
+@dataclass
+class _DatedActivity:
+    """只读日程视图的一项，不回写或搬移源活动。"""
+
+    activity: Activity
+    source_date: str
+    interval: tuple[datetime, datetime]
+    conflicts: list[str] = field(default_factory=list)
+
+
+def _parse_activities(activities: list[Activity], day: datetime) -> list[_DatedActivity]:
+    views = []
+    for activity in activities:
+        try:
+            interval = activity_interval(activity.start, activity.end, day)
+        except ValueError:
+            continue
+        views.append(_DatedActivity(activity, day.strftime("%Y-%m-%d"), interval))
+    return views
+
+
+def _activity_score(interval: tuple[datetime, datetime], now: datetime) -> tuple[int, float]:
+    start_dt, end_dt = interval
+    if start_dt <= now < end_dt:
+        return 0, 0.0
+    distance = (start_dt - now).total_seconds() if now < start_dt else (now - end_dt).total_seconds()
+    return 1, distance
+
+
+def _select_recent_views(
+    views: list[_DatedActivity],
+    now: datetime,
+    *,
+    count: int,
+    window_minutes: int,
+) -> list[_DatedActivity]:
+    if count <= 0 or not views:
+        return []
+    scored = sorted(views, key=lambda view: _activity_score(view.interval, now))
+    window = timedelta(minutes=max(0, int(window_minutes)))
+    in_window = [
+        view for view in scored if view.interval[0] - window <= now <= view.interval[1] + window
+    ]
+    return (in_window or scored)[:count]
+
+
 def select_recent_activities(
     activities: list[Activity],
     now: datetime,
@@ -29,37 +76,89 @@ def select_recent_activities(
     window_minutes: int,
     schedule_date: datetime | None = None,
 ) -> list[tuple[Activity, tuple[datetime, datetime]]]:
-    """选取当前时间附近最近的若干活动。窗口内没有则取全局最近。"""
+    """选取最近活动，优先 [start, end) 内进行中的活动。窗口外取最近。"""
 
-    if count <= 0 or not activities:
-        return []
     day = schedule_date or now.replace(hour=0, minute=0, second=0, microsecond=0)
-    scored: list[tuple[tuple[int, float], Activity, tuple[datetime, datetime]]] = []
-    for activity in activities:
-        try:
-            interval = activity_interval(activity.start, activity.end, day)
-        except ValueError:
-            continue
-        start_dt, end_dt = interval
-        ongoing = start_dt <= now <= end_dt
-        if ongoing:
-            distance = 0.0
-        elif now < start_dt:
-            distance = (start_dt - now).total_seconds()
-        else:
-            distance = (now - end_dt).total_seconds()
-        scored.append(((0 if ongoing else 1, distance), activity, interval))
-    if not scored:
+    selected = _select_recent_views(
+        _parse_activities(activities, day), now, count=count, window_minutes=window_minutes
+    )
+    return [(view.activity, view.interval) for view in selected]
+
+
+def _document_views(
+    document: LifeDocument | None,
+    expected_day: datetime,
+    source_label: str,
+    warnings: list[str],
+) -> list[_DatedActivity]:
+    if document is None:
         return []
-    scored.sort(key=lambda item: item[0])
-    window = timedelta(minutes=max(0, int(window_minutes)))
-    in_window = [
-        (activity, interval)
-        for _score, activity, interval in scored
-        if interval[0] - window <= now <= interval[1] + window
+    try:
+        day = datetime.strptime(document.date, "%Y-%m-%d").replace(tzinfo=expected_day.tzinfo)
+    except (TypeError, ValueError):
+        warnings.append(f"已跳过{source_label}文档：源日期无效，未推断活动时间。")
+        return []
+    if day.date() != expected_day.date():
+        warnings.append(
+            f"已跳过{source_label}文档：源日期 {day:%Y-%m-%d} 与请求日期 "
+            f"{expected_day:%Y-%m-%d} 不一致。"
+        )
+        return []
+    return _parse_activities(document.activities, day)
+
+
+def _build_current_schedule_view(
+    document: LifeDocument | None,
+    yesterday: LifeDocument | None,
+    now: datetime,
+) -> tuple[list[_DatedActivity], list[str]]:
+    """今日与昨日独立落日期；昨日仅保留确实跨入今日且仍进行的活动。"""
+
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    warnings: list[str] = []
+    yesterday_views = _document_views(yesterday, today - timedelta(days=1), "昨日", warnings)
+    carry = [
+        view
+        for view in yesterday_views
+        if view.interval[0].date() < today.date() <= view.interval[1].date()
+        and view.interval[0] <= now < view.interval[1]
     ]
-    selected = in_window[:count] if in_window else [(item[1], item[2]) for item in scored[:count]]
-    return selected
+    views = carry + _document_views(document, today, "今日", warnings)
+    # 先在完整视图上标记重叠，避免 count=1 时隐去另一来源而掩盖冲突。
+    for index, left in enumerate(views):
+        for right in views[index + 1 :]:
+            if max(left.interval[0], right.interval[0]) < min(left.interval[1], right.interval[1]):
+                left.conflicts.append(f"{right.source_date} 日程「{right.activity.title}」")
+                right.conflicts.append(f"{left.source_date} 日程「{left.activity.title}」")
+    return views, warnings
+
+
+def _relative_day_label(day: datetime, now: datetime) -> str:
+    offset = (day.date() - now.date()).days
+    return {-1: "昨日", 0: "今日", 1: "明日"}.get(offset, day.strftime("%Y-%m-%d"))
+
+
+def _format_dated_activity(view: _DatedActivity, now: datetime) -> str:
+    start_dt, end_dt = view.interval
+    if start_dt <= now < end_dt:
+        status = "进行中"
+    elif now < start_dt:
+        status = "待开始"
+    else:
+        status = "已结束"
+    line = format_activity_line(view.activity, cross_day=end_dt.date() > start_dt.date())
+    line += f" | 起止：{start_dt:%Y-%m-%d %H:%M} → {end_dt:%Y-%m-%d %H:%M}"
+    line += f"（{_relative_day_label(start_dt, now)}开始、{_relative_day_label(end_dt, now)}结束）"
+    line += f" | 状态：{status} | 来源：{view.source_date} 日程"
+    if view.conflicts:
+        line += f" | 来源冲突（时段重叠）：与 {'、'.join(view.conflicts)} 重叠，未合并或修改源日程"
+    return line
+
+
+def _format_schedule_view(views: list[_DatedActivity], warnings: list[str], now: datetime) -> str:
+    lines = [_format_dated_activity(view, now) for view in views]
+    lines.extend(f"提示：{warning}" for warning in warnings)
+    return "\n".join(lines)
 
 
 def build_recent_schedule_text(
@@ -68,28 +167,37 @@ def build_recent_schedule_text(
     *,
     count: int,
     window_minutes: int,
+    yesterday: LifeDocument | None = None,
 ) -> str:
-    """生成注入用的最近日程正文。没有活动时返回空字符串。"""
+    """生成最近日程正文，进行中的昨日延续优先。没有活动时返回空字符串。"""
 
-    if document is None:
+    if count <= 0:
         return ""
-    try:
-        day = datetime.strptime(document.date, "%Y-%m-%d")
-    except ValueError:
-        day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    selected = select_recent_activities(
-        document.activities,
-        now,
-        count=count,
-        window_minutes=window_minutes,
-        schedule_date=day,
+    views, warnings = _build_current_schedule_view(document, yesterday, now)
+    today_date = now.strftime("%Y-%m-%d")
+    carry = [view for view in views if view.source_date != today_date]
+    today_views = [view for view in views if view.source_date == today_date]
+    # 延续活动先占数量，今日邻近活动仍独立沿用窗口及窗口外最近兜底。
+    selected = carry[:count] + _select_recent_views(
+        today_views, now, count=count - len(carry), window_minutes=window_minutes
     )
     if not selected:
         return ""
-    lines = []
-    for activity, (start_dt, end_dt) in selected:
-        lines.append(format_activity_line(activity, cross_day=end_dt.date() > start_dt.date()))
-    return "\n".join(lines)
+    return _format_schedule_view(selected, warnings, now)
+
+
+def build_today_schedule_text(
+    document: LifeDocument | None,
+    yesterday: LifeDocument | None,
+    now: datetime,
+) -> str:
+    """展示完整今日日程和昨日仍进行的延续，不受注入数量与窗口限制。"""
+
+    views, warnings = _build_current_schedule_view(document, yesterday, now)
+    views.sort(key=lambda view: view.interval[0])
+    if not views:
+        return "\n".join(["暂无今日日程。", *(f"提示：{warning}" for warning in warnings)])
+    return _format_schedule_view(views, warnings, now)
 
 
 def build_inject_text(
@@ -100,6 +208,7 @@ def build_inject_text(
     window_minutes: int,
     template: str,
     extra_values: dict[str, object] | None = None,
+    yesterday: LifeDocument | None = None,
 ) -> str:
     """渲染注入规划器的完整文本。"""
 
@@ -108,6 +217,7 @@ def build_inject_text(
         now,
         count=count,
         window_minutes=window_minutes,
+        yesterday=yesterday,
     )
     if not recent:
         return ""

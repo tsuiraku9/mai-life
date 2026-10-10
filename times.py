@@ -4,6 +4,33 @@ from __future__ import annotations
 
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+import re
+
+
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_DATETIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?")
+
+
+def parse_date(value: str) -> datetime:
+    """严格解析 YYYY-MM-DD，不接受路径片段或缩写日期。"""
+
+    if not isinstance(value, str) or not _DATE_RE.fullmatch(value):
+        raise ValueError("日期必须是 YYYY-MM-DD")
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("日期不存在，请使用合法的 YYYY-MM-DD") from exc
+
+
+def parse_task_datetime(value: str) -> datetime:
+    """解析配置时区下的完整墙钟时刻，不隐式换日或猜测时区。"""
+
+    if not isinstance(value, str) or not _DATETIME_RE.fullmatch(value):
+        raise ValueError("run_at 必须是 YYYY-MM-DD HH:MM[:SS]，使用插件配置时区")
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("run_at 不是合法的日期时间") from exc
 
 
 def parse_hhmm(value: str) -> time:

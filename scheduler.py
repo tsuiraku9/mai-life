@@ -9,11 +9,11 @@ import asyncio
 import logging
 
 from .config_model import MaiLifeConfig
-from .store import LifeDocument, ShareItem
+from .store import LifeDocument, LifeStore, ShareItem, task_due_at, task_state
 from .times import (
-    combine_on_date,
     is_valid_hhmm,
     next_daily_datetime,
+    parse_task_datetime,
     time_to_minutes,
     wall_clock_now,
 )
@@ -33,13 +33,17 @@ def share_due_status(
     now: datetime,
     *,
     miss_tolerance_minutes: int,
+    owner_date: str = "",
 ) -> str:
-    """返回 pending / due / missed / fired。"""
+    """兼容 fired 结果；提交中和终态不再触发，旧时间锚定归属日。"""
 
-    if item.fired:
+    state = task_state(item)
+    if state == "submitting":
+        return "submitting"
+    if state != "pending":
         return "fired"
     try:
-        due_at = combine_on_date(now, item.time)
+        due_at = task_due_at(item, owner_date or now.strftime("%Y-%m-%d"))
     except ValueError:
         return "missed"
     if now < due_at:
@@ -61,15 +65,28 @@ class LifeScheduler:
         load_today: LoadTodayFn,
         fire_share: FireShareFn,
         mark_share_fired: Callable[[str, str, datetime], Any],
+        store: LifeStore | None = None,
     ) -> None:
         self._get_config = get_config
         self._generate_today = generate_today
         self._load_today = load_today
         self._fire_share = fire_share
         self._mark_share_fired = mark_share_fired
+        self._store = store
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
         self._last_wake_at: dict[str, datetime] = {}
+        if store is not None:
+            for _, item in store.list_tasks():
+                if (task_state(item) != "submitted" and item.state_reason != "submission_result_unknown") or not item.stream_id or not item.fired_at:
+                    continue
+                try:
+                    stamp = parse_task_datetime(item.fired_at)
+                except ValueError:
+                    continue
+                previous = self._last_wake_at.get(item.stream_id)
+                if previous is None or stamp > previous:
+                    self._last_wake_at[item.stream_id] = stamp
 
     async def start(self, *, generate_if_missing: bool = False) -> None:
         """启动循环。重复 start 会先停止旧循环。"""
@@ -103,8 +120,15 @@ class LifeScheduler:
             return True
         if config.schedule.enabled and not document.activities:
             return True
-        if config.share.enabled and not document.shares:
-            return True
+        if config.share.enabled:
+            profiles = [profile.stream.strip() for profile in config.share.stream_profiles if profile.stream.strip()]
+            known = {item.stream_id for item in document.shares if item.source in {"generated", "legacy"}}
+            known.update(document.generated_streams)
+            if not known:
+                return True
+            if any(stream != "all" and stream not in known for stream in profiles):
+                # profile 可能是外部别名，由生成器解析；最多按原启动重试次数补齐。
+                return True
         return False
 
     async def _backfill_missing(self) -> None:
@@ -182,25 +206,34 @@ class LifeScheduler:
         except ValueError:
             logger.exception("时区无效，跳过本次巡检")
             return
-        document = self._load_today(now)
-        if document is None:
-            return
-        for item in document.shares:
+        if self._store is not None:
+            candidates = self._store.list_tasks(pending_only=True)
+        else:
+            document = self._load_today(now)
+            candidates = [(document.date, item) for item in document.shares] if document else []
+        for owner_date, item in candidates:
+            # 前一个 RPC 可能等待较久，宽限与冷却必须使用本项的当前时刻。
+            now = self._now(config)
             status = share_due_status(
-                item,
-                now,
+                item, now, owner_date=owner_date,
                 miss_tolerance_minutes=DEFAULT_MISS_TOLERANCE_MINUTES,
             )
-            if status == "missed" and not item.fired:
-                self._mark_share_fired(document.date, item.id, now)
-                logger.info("分享任务已过宽限，标记跳过: %s %s", item.time, item.title)
+            if status == "missed":
+                if self._store is not None:
+                    self._store.mark_task_state(owner_date, item.stream_id, item.id, "skipped", "missed_tolerance", now, expected=item)
+                else:
+                    self._mark_share_fired(owner_date, item.id, now)
+                logger.info("任务已过宽限，记录跳过: task=%s owner_date=%s", item.id, owner_date)
                 continue
             if status != "due":
+                continue
+            document = self._store.load(owner_date) if self._store is not None else self._load_today(now)
+            if document is None:
                 continue
             try:
                 await self._fire_share(item, document, now)
             except Exception:
-                logger.exception("唤醒规划器失败: share=%s", item.id)
+                logger.exception("提交规划器失败: task=%s", item.id)
 
     def can_wake_stream(self, stream_id: str, now: datetime, cooldown_seconds: int) -> bool:
         """同一聊天流是否已过冷却。"""
