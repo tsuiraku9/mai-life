@@ -1,6 +1,6 @@
 # 麦麦生活
 
-[![version](https://img.shields.io/badge/version-1.3.0-3b82f6?style=flat-square)](https://github.com/tsuiraku9/mai-life)
+[![version](https://img.shields.io/badge/version-1.3.1-3b82f6?style=flat-square)](https://github.com/tsuiraku9/mai-life)
 [![MaiBot](https://img.shields.io/badge/MaiBot-%E2%89%A51.3.1-8b5cf6?style=flat-square)](https://github.com/Mai-with-u/MaiBot)
 [![SDK](https://img.shields.io/badge/maibot--plugin--sdk-%E2%89%A52.7.1-0ea5e9?style=flat-square)](#依赖)
 [![license](https://img.shields.io/badge/license-MIT-22c55e?style=flat-square)](LICENSE)
@@ -94,7 +94,7 @@ extra_prompt = "只聊日常小事，不要提工作。"
 | 项 | 默认 | 说明 |
 | --- | --- | --- |
 | `plugin.enabled` | `false` | 总开关；关闭后停止生成、注入、任务操作和到期唤醒 |
-| `plugin.config_version` | `1.3.0` | 新配置的结构版本；不是用来清空或强制改写旧配置的开关 |
+| `plugin.config_version` | `1.3.1` | 新配置的结构版本；已有个人配置按原值保留 |
 | `plugin.admin_user_ids` | `[]` | 管理员命令权限，格式为 `platform:user_id` |
 
 管理员名单为空时，聊天用户不能使用任何 `/mai_life_*` 命令；本地控制台操作员始终可用。规划器工具则按当前流及对应功能白名单检查，不以管理员名单替代聊天流权限。
@@ -145,8 +145,10 @@ extra_prompt = "只聊日常小事，不要提工作。"
 | 项 | 默认 | 说明 |
 | --- | --- | --- |
 | `stream` | 空 | 流标识，填写即启用 |
-| `count_min` / `count_max` | `3` / `6` | 此流每日自动分享的数量；不限制自主任务数量 |
+| `count_min` / `count_max` | `3` / `6` | 此流自动分享的生成条数范围；0 下限允许零条，0～0 关闭自动分享生成，自主任务独立运行 |
 | `extra_prompt` | 空 | 此流自动分享的额外生成提示词；不作为自主任务的创建请求 |
+
+自动分享数量采用非负整数，上限至少等于下限。0～0 时直接完成该流的零条生成，并清除该流可替换的待处理自动分享；自主任务和终态记录保持原状。模型返回的合法分享按配置上限截取，静默过滤后可能少于下限。重新生成保留已提交等终态任务，展示总数包含这些历史记录。
 
 ### 聊天流写法
 
@@ -175,7 +177,11 @@ extra_prompt = "只聊日常小事，不要提工作。"
 
 ### 提示词
 
-`prompts` 分组可以修改日程生成、自动分享生成、日程自然语言修改、注入文本和唤醒模板。留空回落到内置默认，未知占位符原样保留。结构化任务管理不调用日程修改模型，日程修改也不向辅助 LLM 传入统一任务列表；兼容的 `{share_json}` 在日程修改分支固定为 `{}`，在自动分享生成分支仍表示该流分享记录。自主任务到期直接使用其具体 `intent`，不套用“可考虑分享、不一定说”的生活分享模板。
+`prompts` 分组可以修改日程生成、自动分享生成、日程自然语言修改、注入文本和唤醒模板。留空回落到内置默认，未知占位符原样保留。结构化任务管理不调用日程修改模型，日程修改也不向辅助 LLM 传入统一任务列表；兼容的 `{share_json}` 在日程修改分支固定为 `{}`，在自动分享生成分支仍表示该流分享记录。
+
+自动分享的生成结果只读取 `time`、`title`、`hint`，到期统一使用当前 `wake_intent_template`；这一规则同时适用于升级前保存的自动分享。`{share_item}` 提供任务时间、标题和内容提示。自主任务到期直接使用其具体 `intent`，接管自动分享时须填写明确意图。
+
+升级到 v1.3.1 时，原“分享用户提示词”与 v1.3.0 完整默认文案一致的配置会自动更新为新版默认值；空白配置继续使用当前内置默认值，自定义文案保持原样。自定义文案可保留内容偏好，将生成字段调整为 `time`、`title`、可选 `hint`，同步移除独立 `intent` 的生成说明及 JSON 示例字段。现有唤醒意图模板保留原值，建议保留 `{share_item}` 用于带入自动分享内容。
 
 <details>
 <summary>占位符</summary>
@@ -192,7 +198,7 @@ extra_prompt = "只聊日常小事，不要提工作。"
 | `{share_count_min}` `{share_count_max}` | 当前流的自动分享条数范围 |
 | `{silence_start}` `{silence_end}` | 自动分享生成静默时段 |
 | `{stream_info}` `{stream_id}` `{extra_prompt}` | 当前流信息、ID、该流额外提示词 |
-| `{share_item}` | 自动分享缺少独立意图时供唤醒模板使用的内容 |
+| `{share_item}` | 自动分享的时间、标题及内容提示，供统一唤醒模板使用 |
 | `{user_request}` `{target}` `{action}` | 日程修改请求、目标、动作 |
 
 </details>
@@ -365,7 +371,7 @@ PYTHONPATH="$PWD" .venv/bin/python -B -m pytest -p no:cacheprovider mailife/test
 ```bash
 git diff --cached --name-only
 git diff --cached --check
-git archive --format=tar.gz --output=mai-life-v1.3.0.tar.gz HEAD
+git archive --format=tar.gz --output=mai-life-v1.3.1.tar.gz HEAD
 ```
 
 正式发布前再次核对远端版本和 Tag；manifest、三段式 Tag 与非草稿 Release 版本应一致。若版本已被发布/收录，应递增版本，不能覆盖历史 Tag。代码修改、离线测试、生产重载和外部发布分别确认，不因文档写有版本号就视为已发布。

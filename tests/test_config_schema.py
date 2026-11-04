@@ -6,7 +6,9 @@ from pathlib import Path
 import pytest
 
 from mailife.config_model import MaiLifeConfig, ToolSection
+from mailife.config_migrations import DEFAULT_SHARE_USER_V1_3_0
 from mailife.plugin import MaiLifePlugin
+from mailife.prompts import DEFAULT_SHARE_USER
 from mailife.tool_descriptions import DEFAULT_MODIFY_TOOL_DESCRIPTION, DEFAULT_QUERY_TOOL_DESCRIPTION
 
 
@@ -49,6 +51,56 @@ def test_webui_field_labels_are_chinese() -> None:
             if label.isascii() and "_" in label:
                 english_labels.append(label)
     assert english_labels == []
+
+
+def test_share_count_schema_accepts_zero() -> None:
+    fields = MaiLifeConfig.model_json_schema()["$defs"]["ShareStreamProfile"]["properties"]
+    assert fields["count_min"]["minimum"] == fields["count_max"]["minimum"] == 0
+
+
+@pytest.mark.parametrize("value", [DEFAULT_SHARE_USER_V1_3_0, DEFAULT_SHARE_USER_V1_3_0.strip(), "\n" + DEFAULT_SHARE_USER_V1_3_0 + "\n"])
+def test_previous_default_share_prompt_updates_automatically(value) -> None:
+    supplied = {"plugin": {"config_version": "1.3.0"}, "prompts": {"share_user": value}}
+    before = deepcopy(supplied)
+    config = MaiLifeConfig.model_validate(supplied)
+    assert config.prompts.share_user == DEFAULT_SHARE_USER
+    assert supplied == before
+
+
+@pytest.mark.parametrize("value", [
+    "", " \t\n", DEFAULT_SHARE_USER,
+    DEFAULT_SHARE_USER_V1_3_0 + "\n合成自定义要求：分享阅读心得。",
+    DEFAULT_SHARE_USER_V1_3_0.replace("可以考虑分享什么", "可以考虑发送什么"),
+    "合成自定义提示词：{date} {stream_info} {extra_prompt}",
+])
+def test_custom_and_empty_share_prompts_keep_existing_values(value) -> None:
+    config = MaiLifeConfig.model_validate({"prompts": {"share_user": value}})
+    assert config.prompts.share_user == value
+
+
+def test_sdk_upgrade_normalization_updates_default_prompt_and_preserves_personal_fields() -> None:
+    from maibot_sdk.config import rebuild_plugin_config_data
+
+    supplied = {
+        "plugin": {"config_version": "1.3.0", "enabled": True, "admin_user_ids": ["test:synthetic-admin"]},
+        "generation": {"extra_persona": "合成人设偏好", "model": "synthetic-model"},
+        "share": {"stream_profiles": [{"stream": "session:synthetic-stream", "count_min": 0, "count_max": 1, "extra_prompt": "合成内容偏好"}]},
+        "prompts": {"share_user": DEFAULT_SHARE_USER_V1_3_0, "wake_intent_template": "合成唤醒模板：{share_item}"},
+    }
+    plugin = MaiLifePlugin()
+    default = plugin.build_default_config()
+    upgraded = rebuild_plugin_config_data(default, supplied)
+    normalized, changed = plugin.normalize_plugin_config(upgraded)
+    assert changed is True
+    assert normalized["plugin"]["config_version"] == "1.3.1"
+    assert normalized["prompts"]["share_user"] == DEFAULT_SHARE_USER
+    for section_name, fields in supplied.items():
+        for field_name, value in fields.items():
+            if (section_name, field_name) not in {("plugin", "config_version"), ("prompts", "share_user")}:
+                assert normalized[section_name][field_name] == value
+    second_pass, changed_again = plugin.normalize_plugin_config(normalized)
+    assert second_pass == normalized
+    assert changed_again is False
 
 
 def test_tools_section_shows_editable_defaults_and_reload_hints() -> None:
@@ -160,7 +212,7 @@ def test_public_template_manifest_and_schema_use_same_proposed_version() -> None
     plugin_dir = Path(__file__).resolve().parents[1]
     manifest = json.loads((plugin_dir / "_manifest.json").read_text(encoding="utf-8"))
     example = tomllib.loads((plugin_dir / "config.example.toml").read_text(encoding="utf-8"))
-    assert manifest["version"] == MaiLifeConfig().plugin.config_version == example["plugin"]["config_version"] == "1.3.0"
+    assert manifest["version"] == MaiLifeConfig().plugin.config_version == example["plugin"]["config_version"] == "1.3.1"
     assert example["tools"] == ToolSection().model_dump()
     config = MaiLifeConfig.model_validate(example)
     assert config.tools == ToolSection()

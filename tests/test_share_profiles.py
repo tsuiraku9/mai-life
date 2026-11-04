@@ -1,3 +1,5 @@
+import pytest
+
 from mailife.config_model import MaiLifeConfig, ShareStreamProfile, resolve_share_profile, share_allowlist
 from mailife.store import LifeDocument, ShareItem, document_from_dict, replace_stream_shares, shares_for_stream
 
@@ -30,16 +32,40 @@ def test_resolve_share_profile_override() -> None:
     assert (other_min, other_max, other_extra) == (3, 6, "")
 
 
-def test_resolve_share_profile_zero_counts_use_builtin_default() -> None:
+@pytest.mark.parametrize(("minimum", "maximum"), [(0, 0), (0, 1), (0, 6), (1, 1)])
+def test_resolve_share_profile_preserves_zero_bounds(minimum, maximum) -> None:
     config = MaiLifeConfig()
     config.share.stream_profiles = [
-        ShareStreamProfile(stream="qq:private:111", count_min=0, count_max=0, extra_prompt="只聊学习"),
+        ShareStreamProfile(stream="qq:private:111", count_min=minimum, count_max=maximum, extra_prompt="只聊学习"),
     ]
     count_min, count_max, extra = resolve_share_profile(
         config.share,
         {"session_id": "s1", "platform": "qq", "user_id": "111"},
     )
-    assert (count_min, count_max, extra) == (3, 6, "只聊学习")
+    assert (count_min, count_max, extra) == (minimum, maximum, "只聊学习")
+
+
+def test_legacy_share_fields_preserve_explicit_profile_zero() -> None:
+    config = MaiLifeConfig.model_validate({"share": {
+        "count_min": 3, "count_max": 6,
+        "stream_profiles": [{"stream": "session:a", "count_min": 0, "count_max": 0}],
+    }})
+    profile = config.share.stream_profiles[0]
+    assert (profile.count_min, profile.count_max) == (0, 0)
+
+
+def test_legacy_zero_share_fields_populate_missing_profile_bounds() -> None:
+    config = MaiLifeConfig.model_validate({"share": {
+        "count_min": 0, "count_max": 0, "stream_profiles": [{"stream": "session:a"}],
+    }})
+    profile = config.share.stream_profiles[0]
+    assert (profile.count_min, profile.count_max) == (0, 0)
+
+
+@pytest.mark.parametrize("field", ["count_min", "count_max"])
+def test_share_counts_require_nonnegative_values(field) -> None:
+    with pytest.raises(ValueError):
+        ShareStreamProfile(**{field: -1})
 
 
 def test_share_allowlist_comes_from_profiles() -> None:

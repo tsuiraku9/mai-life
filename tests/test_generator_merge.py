@@ -3,7 +3,7 @@ from datetime import datetime
 
 import pytest
 
-from mailife.config_model import MaiLifeConfig
+from mailife.config_model import MaiLifeConfig, ShareStreamProfile
 from mailife.generator import LifeGenerator
 from mailife.store import Activity, LifeDocument, LifeStore, ShareItem, task_state
 from mailife.tasks import TaskManager
@@ -44,7 +44,7 @@ def generate(generator, config=None, force=False, streams=None):
 
 
 def share_answer(time="12:00", title="午间分享", **extra):
-    return {"shares": [{"time": time, "title": title, "intent": "自然提起日常", **extra}]}
+    return {"shares": [{"time": time, "title": title, **extra}]}
 
 
 def add_planner(store):
@@ -76,7 +76,7 @@ def test_forced_regeneration_retains_planner_adopted_and_terminal(tmp_path):
     add_planner(store)
     generated = generate(FakeGenerator(store, [share_answer()]))
     original = next(item for item in generated.shares if item.source == "generated")
-    TaskManager(store).manage(action="update", stream_id="stream-a", now=NOW, timezone="local", task_id=original.id, title="接管分享")
+    TaskManager(store).manage(action="update", stream_id="stream-a", now=NOW, timezone="local", task_id=original.id, title="接管分享", intent="履行接管后的分享约定")
     store.mutate("2031-04-15", lambda doc: doc.shares.extend([
         ShareItem("terminal", "11:00", "已提交", stream_id="stream-a", intent="旧意图", source="generated", due_at="2031-04-15T11:00:00", state="submitted", fired=True),
         ShareItem("replaceable", "13:00", "可重新生成", stream_id="stream-a", source="generated", due_at="2031-04-15T13:00:00"),
@@ -163,7 +163,7 @@ def test_generation_merge_keeps_task_adopted_while_model_worked(tmp_path):
     store = LifeStore(tmp_path)
     original = generate(FakeGenerator(store, [share_answer()])).shares[0]
     generator = FakeGenerator(store, [share_answer("15:00")])
-    generator.during = lambda: TaskManager(store).manage(action="update", stream_id="stream-a", now=NOW, timezone="local", task_id=original.id, title="接管分享")
+    generator.during = lambda: TaskManager(store).manage(action="update", stream_id="stream-a", now=NOW, timezone="local", task_id=original.id, title="接管分享", intent="履行接管后的分享约定")
     result = generate(generator, force=True)
     assert any(item.id == original.id and item.source == "planner" for item in result.shares)
     assert len(result.shares) == 2
@@ -180,7 +180,7 @@ def test_schedule_modification_merge_keeps_new_tasks_and_states(tmp_path):
 
 
 @pytest.mark.parametrize("changes", [
-    {"run_at": "2031-04-15 13:00"},
+    {"run_at": "2031-04-15 13:00", "intent": "履行改期后的提醒约定"},
     {"intent": "已约定提醒，与原自由分享不同"},
     {"run_at": "2031-04-15 13:00", "intent": "已约定提醒，与原自由分享不同"},
 ])
@@ -220,12 +220,12 @@ def test_same_stream_same_time_terminal_not_reintroduced(tmp_path):
 @pytest.mark.parametrize("adopt", ["add", "update"])
 def test_preexisting_generated_record_acquires_signature_before_adoption(tmp_path, adopt):
     store = LifeStore(tmp_path)
-    original = ShareItem("preexisting", "12:00", "合成旧自动任务", stream_id="stream-a", intent="自然提起日常", source="generated", due_at="2031-04-15T12:00:00")
+    original = ShareItem("preexisting", "12:00", "午间分享", stream_id="stream-a", intent="午间分享" if adopt == "add" else "", source="generated", due_at="2031-04-15T12:00:00")
     store.save(LifeDocument("2031-04-15", "", shares=[original]))
     manager = TaskManager(store)
     if adopt == "add":
         manager.manage(action="add", stream_id="stream-a", now=NOW, timezone="local", title="合成接管标题", intent=original.intent, run_at=original.due_at)
-    manager.manage(action="update", stream_id="stream-a", now=NOW, timezone="local", task_id=original.id, run_at="2031-04-15 13:00")
+    manager.manage(action="update", stream_id="stream-a", now=NOW, timezone="local", task_id=original.id, run_at="2031-04-15 13:00", intent="履行接管后的分享约定")
     store = LifeStore(tmp_path)
     result = generate(FakeGenerator(store, [share_answer()]), force=True)
     assert len(result.shares) == 1
@@ -239,7 +239,7 @@ def test_generation_deduplicates_same_full_signature_from_other_owner(tmp_path, 
     original = ShareItem(
         "previous-owner", "12:00", "昨日日文件的合成提醒", source="planner",
         stream_id="stream-b" if different == "stream" else "stream-a",
-        intent="另一合成意图" if different == "intent" else "自然提起日常",
+        intent="另一合成意图" if different == "intent" else "午间分享",
         due_at="2031-04-16T12:00:00" if different == "day" else "2031-04-15T12:00:00",
     )
     store.save(LifeDocument("2031-04-14", "", shares=[original]))
@@ -247,6 +247,54 @@ def test_generation_deduplicates_same_full_signature_from_other_owner(tmp_path, 
     assert result.generated_streams == ["stream-a"]
     assert len(store.list_tasks()) == (1 if different == "same" else 2)
     assert store.find_task(original.stream_id, original.id)[0] == "2031-04-14"
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_zero_share_generation_preserves_planner_and_terminal_tasks(tmp_path, force):
+    store = LifeStore(tmp_path)
+    planned = add_planner(store)
+    store.mutate("2031-04-15", lambda doc: doc.shares.extend([
+        ShareItem("pending-auto", "12:00", "自动分享", stream_id="stream-a", source="generated", due_at="2031-04-15T12:00:00"),
+        ShareItem("submitted-auto", "11:00", "已提交分享", stream_id="stream-a", source="generated", due_at="2031-04-15T11:00:00", state="submitted", fired=True),
+        ShareItem("other-stream", "14:00", "其他流分享", stream_id="stream-b", source="generated", due_at="2031-04-15T14:00:00"),
+    ]))
+    config = config_without_schedule()
+    config.share.stream_profiles = [ShareStreamProfile(stream="stream-a", count_min=0, count_max=0)]
+    generator = FakeGenerator(store, [])
+    result = generate(generator, config, force=force)
+    assert generator.calls == 0
+    assert {item.id for item in result.shares} == {planned["task_id"], "submitted-auto", "other-stream"}
+    assert result.generated_streams == ["stream-a"]
+
+
+def test_zero_share_generation_records_empty_stream(tmp_path):
+    config = config_without_schedule()
+    config.share.stream_profiles = [ShareStreamProfile(stream="stream-a", count_min=0, count_max=0)]
+    generator = FakeGenerator(LifeStore(tmp_path), [])
+    result = generate(generator, config)
+    assert result.shares == []
+    assert result.generated_streams == ["stream-a"]
+    generate(generator, config)
+    assert generator.calls == 0
+
+
+@pytest.mark.parametrize(("minimum", "maximum", "returned", "expected"), [(0, 1, 3, 1), (1, 1, 3, 1), (0, 6, 0, 0), (0, 1, 0, 0)])
+def test_automatic_generation_enforces_stream_upper_bound(tmp_path, minimum, maximum, returned, expected):
+    config = config_without_schedule()
+    config.share.stream_profiles = [ShareStreamProfile(stream="stream-a", count_min=minimum, count_max=maximum)]
+    answer = {"shares": [{"time": f"{12 + i}:00", "title": f"合成分享{i}"} for i in range(returned)]}
+    generator = FakeGenerator(LifeStore(tmp_path), [answer])
+    result = generate(generator, config)
+    assert len(result.shares) == expected
+    assert f"生成 {minimum} 到 {maximum} 条" in generator.prompts[0][1]
+
+
+def test_automatic_generation_reads_share_content_fields(tmp_path):
+    generator = FakeGenerator(LifeStore(tmp_path), [share_answer(intent="模型额外返回的旧意图", hint="散步时拍到的小花")])
+    result = generate(generator)
+    item = result.shares[0]
+    assert (item.title, item.hint, item.intent) == ("午间分享", "散步时拍到的小花", "")
+    assert item.generation_key == '["2031-04-15T12:00:00", "午间分享"]'
 
 
 @pytest.mark.parametrize("stream_id", ["", "stream-a"])

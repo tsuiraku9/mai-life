@@ -5,7 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from maibot_sdk import Field, PluginConfigBase
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
+
+from .config_migrations import DEFAULT_SHARE_USER_V1_3_0
 
 from .prompts import (
     DEFAULT_INJECT_TEMPLATE,
@@ -45,7 +47,7 @@ class PluginSection(PluginConfigBase):
         json_schema_extra=_ui("启用插件"),
     )
     config_version: str = Field(
-        default="1.3.0",
+        default="1.3.1",
         description="配置结构版本，一般不用改",
         json_schema_extra=_ui("配置版本"),
     )
@@ -222,12 +224,14 @@ class ShareStreamProfile(PluginConfigBase):
     )
     count_min: int = Field(
         default=DEFAULT_SHARE_COUNT_MIN,
-        description="该聊天流每天最少生成几条分享任务",
+        ge=0,
+        description="该聊天流自动分享生成条数下限，0 表示允许零条",
         json_schema_extra=_ui("生成条数下限"),
     )
     count_max: int = Field(
         default=DEFAULT_SHARE_COUNT_MAX,
-        description="该聊天流每天最多生成几条分享任务",
+        ge=0,
+        description="该聊天流自动分享生成条数上限；上下限均为 0 时关闭自动分享生成，自主单次任务独立运行",
         json_schema_extra=_ui("生成条数上限"),
     )
     extra_prompt: str = Field(
@@ -281,16 +285,16 @@ class ShareSection(PluginConfigBase):
         legacy_min = merged.get("count_min")
         legacy_max = merged.get("count_max")
         legacy_extra = str(merged.get("extra_prompt") or "").strip()
-        if profiles and (legacy_min or legacy_max or legacy_extra):
+        if profiles and (legacy_min is not None or legacy_max is not None or legacy_extra):
             updated: list[Any] = []
             for profile in profiles:
                 if not isinstance(profile, dict):
                     updated.append(profile)
                     continue
                 item = dict(profile)
-                if not int(item.get("count_min") or 0) and legacy_min:
+                if "count_min" not in item and legacy_min is not None:
                     item["count_min"] = legacy_min
-                if not int(item.get("count_max") or 0) and legacy_max:
+                if "count_max" not in item and legacy_max is not None:
                     item["count_max"] = legacy_max
                 if not str(item.get("extra_prompt") or "").strip() and legacy_extra:
                     item["extra_prompt"] = legacy_extra
@@ -400,9 +404,18 @@ class PromptSection(PluginConfigBase):
     )
     wake_intent_template: str = Field(
         default=DEFAULT_WAKE_INTENT_TEMPLATE,
-        description="到点唤醒规划器时的意图文本",
+        description="所有自动分享到点唤醒规划器时统一使用的意图模板；自主单次任务仍使用各自的明确意图",
         json_schema_extra=_ui("唤醒意图模板", textarea=True),
     )
+
+    @field_validator("share_user", mode="before")
+    @classmethod
+    def _upgrade_default_share_user(cls, value: Any) -> Any:
+        """将已发布的完整默认文案迁移为当前默认值，自定义内容保持原样。"""
+
+        if isinstance(value, str) and value.strip() == DEFAULT_SHARE_USER_V1_3_0.strip():
+            return DEFAULT_SHARE_USER
+        return value
 
 
 class MaiLifeConfig(PluginConfigBase):
@@ -425,11 +438,10 @@ def share_allowlist(share: ShareSection) -> list[str]:
 
 
 def _share_counts(count_min: int, count_max: int) -> tuple[int, int]:
-    """条数填 0 时回落到内置默认值，并保证上限不小于下限。"""
+    """解析非负条数范围，上限按下限校正。"""
 
-    resolved_min = int(count_min) if int(count_min) > 0 else DEFAULT_SHARE_COUNT_MIN
-    resolved_max = int(count_max) if int(count_max) > 0 else DEFAULT_SHARE_COUNT_MAX
-    resolved_min = max(1, resolved_min)
+    resolved_min = max(0, int(count_min))
+    resolved_max = max(0, int(count_max))
     return resolved_min, max(resolved_min, resolved_max)
 
 

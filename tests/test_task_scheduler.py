@@ -319,3 +319,45 @@ def test_generated_without_intent_keeps_existing_optional_share_template(tmp_pat
     tick(plugin)
     assert proactive.calls[0]["reason"] == "mai_life_share"
     assert "可以不说" in proactive.calls[0]["intent"]
+
+
+@pytest.mark.parametrize("saved_intent", ["", "升级前保存的独立意图"])
+def test_generated_task_uses_current_wake_template(tmp_path, saved_intent):
+    plugin, proactive = setup_plugin(tmp_path, tasks=[task(source="generated", intent=saved_intent)])
+    config = plugin.config.model_copy(deep=True)
+    config.prompts.wake_intent_template = "当前模板：{share_item}；时间 {now}"
+    plugin.set_plugin_config(config.model_dump(mode="python"))
+    tick(plugin)
+    assert proactive.calls[0]["intent"] == "当前模板：23:59 合成到期意图；时间 2031-04-16 00:10"
+    assert proactive.calls[0]["reason"] == "mai_life_share"
+
+
+def test_zero_automatic_share_count_preserves_planner_execution(tmp_path):
+    plugin, proactive = setup_plugin(tmp_path, tasks=[task("auto", source="generated"), task("planned")])
+    config = plugin.config.model_copy(deep=True)
+    config.share.stream_profiles = [ShareStreamProfile(stream="all", count_min=0, count_max=0)]
+    plugin.set_plugin_config(config.model_dump(mode="python"))
+    tick(plugin)
+    assert len(proactive.calls) == 1
+    assert proactive.calls[0]["metadata"]["task_id"] == "planned"
+    assert proactive.calls[0]["intent"] == "履行合成提醒约定"
+    assert stored(plugin, "auto").state == "cancelled"
+    assert stored(plugin, "auto").state_reason == "auto_share_disabled"
+    assert stored(plugin, "planned").state == "submitted"
+
+
+def test_planner_task_uses_explicit_intent_with_custom_template(tmp_path):
+    plugin, proactive = setup_plugin(tmp_path)
+    config = plugin.config.model_copy(deep=True)
+    config.prompts.wake_intent_template = "自由分享：{share_item}"
+    plugin.set_plugin_config(config.model_dump(mode="python"))
+    tick(plugin)
+    assert proactive.calls[0]["intent"] == "履行合成提醒约定"
+
+
+def test_planner_task_requires_explicit_intent(tmp_path):
+    plugin, proactive = setup_plugin(tmp_path, tasks=[task(intent="")])
+    tick(plugin)
+    assert proactive.calls == []
+    assert stored(plugin).state == "skipped"
+    assert stored(plugin).state_reason == "missing_planner_intent"

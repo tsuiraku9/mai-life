@@ -24,8 +24,8 @@ from maibot_sdk.types import (
     ToolParamType,
 )
 
-from .config_model import MaiLifeConfig, share_allowlist
-from .generator import LifeGenerator, format_activities, format_shares, format_shares_by_stream
+from .config_model import MaiLifeConfig, resolve_share_profile, share_allowlist
+from .generator import LifeGenerator, format_activities, format_shares_by_stream
 from .injector import build_inject_text, build_today_schedule_text, inject_into_items, inject_into_messages
 from .prompts import DEFAULT_WAKE_INTENT_TEMPLATE, choose_template, render_template
 from .scheduler import DEFAULT_MISS_TOLERANCE_MINUTES, LifeScheduler, share_due_status
@@ -34,7 +34,6 @@ from .tasks import TaskManager, format_task_records
 from .tool_descriptions import DEFAULT_MODIFY_TOOL_DESCRIPTION, DEFAULT_QUERY_TOOL_DESCRIPTION
 from .streams import (
     filter_streams,
-    format_stream_info,
     normalize_text,
     session_allowed,
     stream_session_id,
@@ -616,6 +615,9 @@ class MaiLifePlugin(MaiBotPlugin):
             # Host 流暂不可发现或不在白名单时保持 pending，宽限后由巡检记录跳过。
             logger.info("任务到期但当前未匹配白名单真实聊天流: task=%s", item.id)
             return
+        if item.source == "generated" and resolve_share_profile(self.config.share, streams[0])[1] == 0:
+            self._store.mark_task_state(document.date, target_stream_id, item.id, "cancelled", "auto_share_disabled", now, expected=item)
+            return
         if not self.config.plugin.enabled or not self.config.share.enabled or not self.config.share.wake_planner:
             return
         now = self._now()
@@ -630,7 +632,7 @@ class MaiLifePlugin(MaiBotPlugin):
         claimed = self._store.claim_task(document.date, item)
         if claimed is None:
             return
-        intent = claimed.intent.strip()
+        intent = "" if claimed.source == "generated" else claimed.intent.strip()
         if not intent and claimed.source == "planner":
             self._store.mark_task_state(document.date, target_stream_id, item.id, "skipped", "missing_planner_intent", now, expected_state="submitting")
             return

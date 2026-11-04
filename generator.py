@@ -28,7 +28,6 @@ from .store import (
     ShareItem,
     activity_from_dict,
     new_task_id,
-    share_from_dict,
     shares_for_stream,
     stream_generation_done,
     task_signature,
@@ -87,7 +86,7 @@ def parse_activities(data: dict[str, Any]) -> list[Activity]:
 
 
 def parse_shares(data: dict[str, Any]) -> list[ShareItem]:
-    """解析 shares 列表，跳过非法项。"""
+    """从模型输出读取自动分享的时间、标题与内容提示。"""
 
     raw_items = data.get("shares")
     if not isinstance(raw_items, list):
@@ -96,9 +95,10 @@ def parse_shares(data: dict[str, Any]) -> list[ShareItem]:
     for index, item in enumerate(raw_items):
         if not isinstance(item, dict):
             continue
-        parsed = share_from_dict(item, index)
-        if parsed is not None:
-            result.append(parsed)
+        time_str = normalize_text(item.get("time"))
+        title = normalize_text(item.get("title"))
+        if title and is_valid_hhmm(time_str):
+            result.append(ShareItem(id=f"share_{index}", time=time_str, title=title, hint=normalize_text(item.get("hint"))))
     return result
 
 
@@ -340,6 +340,10 @@ class LifeGenerator:
         )
 
         generated_by_stream: dict[str, list[ShareItem]] = {}
+        zero_share_streams = {
+            stream_session_id(stream) for stream in share_streams or []
+            if resolve_share_profile(config.share, stream)[1] == 0
+        }
         if config.share.enabled:
             generated_by_stream = await self._generate_shares_for_streams(
                 config, values, document, share_streams or [], history_by_stream or {}, force=force,
@@ -356,11 +360,10 @@ class LifeGenerator:
                 else:
                     logger.warning("生成期间日程已被修改，保留最新日程 date=%s", date)
             for stream_id, fresh in generated_by_stream.items():
-                current = shares_for_stream(latest, stream_id)
                 if any(item.source == "legacy" for item in latest.shares if item.stream_id in {"", stream_id}):
                     logger.warning("旧任务来源不明，保护该流并跳过自动分享重生成 date=%s stream=%s", date, stream_id)
                     continue
-                if not force and stream_generation_done(latest, stream_id):
+                if not force and stream_generation_done(latest, stream_id) and stream_id not in zero_share_streams:
                     continue
                 kept = [
                     item for item in latest.shares
@@ -542,9 +545,13 @@ class LifeGenerator:
             if any(item.source == "legacy" for item in document.shares if item.stream_id in {"", session_id}):
                 logger.warning("旧任务来源不明，保护该流并跳过自动分享重生成 date=%s stream=%s", document.date, session_id)
                 continue
+            count_min, count_max, extra_prompt = resolve_share_profile(config.share, stream)
+            if count_max == 0:
+                generated[session_id] = []
+                logger.info("该聊天流自动分享数量为 0，跳过模型生成: session=%s", session_id)
+                continue
             if not force and stream_generation_done(document, session_id):
                 continue
-            count_min, count_max, extra_prompt = resolve_share_profile(config.share, stream)
             stream_values = dict(values)
             stream_values.update(
                 {
@@ -565,11 +572,14 @@ class LifeGenerator:
             if shares is None:
                 logger.error("聊天流分享任务生成失败，未标记生成完成: session=%s", session_id)
                 continue
+            if len(shares) > count_max:
+                logger.warning("分享任务超过配置上限，保留前 %s 条: session=%s returned=%s", count_max, session_id, len(shares))
+                shares = shares[:count_max]
             # ID、来源和状态由可信代码生成，不能接受模型伪造的 fired/stream/source。
             fresh = [
                 ShareItem(
                     id=new_task_id(), time=item.time, title=item.title, hint=item.hint,
-                    intent=item.intent, stream_id=session_id, source="generated",
+                    stream_id=session_id, source="generated",
                     due_at=combine_on_date(parse_date(document.date), item.time).isoformat(timespec="seconds"),
                 )
                 for item in shares
