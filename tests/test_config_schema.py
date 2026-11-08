@@ -208,11 +208,12 @@ def test_default_tool_descriptions_are_concise_and_actionable() -> None:
     assert "不支持周期任务" in DEFAULT_MODIFY_TOOL_DESCRIPTION
 
 
-def test_public_template_manifest_and_schema_use_same_proposed_version() -> None:
+def test_public_template_and_schema_keep_config_version_for_compatibility_release() -> None:
     plugin_dir = Path(__file__).resolve().parents[1]
     manifest = json.loads((plugin_dir / "_manifest.json").read_text(encoding="utf-8"))
     example = tomllib.loads((plugin_dir / "config.example.toml").read_text(encoding="utf-8"))
-    assert manifest["version"] == MaiLifeConfig().plugin.config_version == example["plugin"]["config_version"] == "1.3.1"
+    assert manifest["version"] == "1.3.2"
+    assert MaiLifeConfig().plugin.config_version == example["plugin"]["config_version"] == "1.3.1"
     assert example["tools"] == ToolSection().model_dump()
     config = MaiLifeConfig.model_validate(example)
     assert config.tools == ToolSection()

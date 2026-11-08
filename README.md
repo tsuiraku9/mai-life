@@ -1,6 +1,6 @@
 # 麦麦生活
 
-[![version](https://img.shields.io/badge/version-1.3.1-3b82f6?style=flat-square)](https://github.com/tsuiraku9/mai-life)
+[![version](https://img.shields.io/badge/version-1.3.2-3b82f6?style=flat-square)](https://github.com/tsuiraku9/mai-life)
 [![MaiBot](https://img.shields.io/badge/MaiBot-%E2%89%A51.3.1-8b5cf6?style=flat-square)](https://github.com/Mai-with-u/MaiBot)
 [![SDK](https://img.shields.io/badge/maibot--plugin--sdk-%E2%89%A52.7.1-0ea5e9?style=flat-square)](#依赖)
 [![license](https://img.shields.io/badge/license-MIT-22c55e?style=flat-square)](LICENSE)
@@ -371,15 +371,15 @@ PYTHONPATH="$PWD" .venv/bin/python -B -m pytest -p no:cacheprovider mailife/test
 ```bash
 git diff --cached --name-only
 git diff --cached --check
-git archive --format=tar.gz --output=mai-life-v1.3.1.tar.gz HEAD
+git archive --format=tar.gz --output=mai-life-v1.3.2.tar.gz HEAD
 ```
 
 正式发布前再次核对远端版本和 Tag；manifest、三段式 Tag 与非草稿 Release 版本应一致。若版本已被发布/收录，应递增版本，不能覆盖历史 Tag。代码修改、离线测试、生产重载和外部发布分别确认，不因文档写有版本号就视为已发布。
 
 ## 依赖
 
-- **MaiBot >= 1.3.1**：已静态核验 `plugin.invoke_action` 强制当前流绑定契约；旧 1.2.3 不作为此安全契约的验证范围。
-- **maibot-plugin-sdk >= 2.7.1**：manifest 最低版本保留，离线 schema/组件注册测试使用 **2.8.2**。
+- **MaiBot >= 1.3.1, <= 1.4.99**：已核验 1.4.2 保留 `plugin.invoke_action` 强制当前流绑定契约；旧 1.2.3 不作为此安全契约的验证范围。
+- **maibot-plugin-sdk >= 2.7.1, < 3.0.0**：保留原最低版本要求。
 - 离线测试建议 Python **3.11+**，测试依赖 SDK 与 `pytest`。
 
 ## 协议

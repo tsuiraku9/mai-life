@@ -81,7 +81,7 @@ class MaiLifePlugin(MaiBotPlugin):
                 metadata = dict(component["metadata"])
                 metadata["description"] = descriptions[component["name"]]
                 metadata["brief_description"] = descriptions[component["name"]]
-                # Host 的 action 调用入口强制绑定当前流；普通 tool 入口仅补缺失值。
+                # Host（含已核验的 1.4.2）在 action 调用入口强制绑定当前流；普通 tool 入口仅补缺失值。
                 # 组件仍是 TOOL，Runner 使用同一 handler/结果协议，不读取 action_data 的目标流。
                 metadata["invoke_method"] = "plugin.invoke_action"
                 component["metadata"] = metadata
